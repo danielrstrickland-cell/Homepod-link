@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.6.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 SAMPLE_RATE = 44100
@@ -42,7 +42,7 @@ SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 LOG_FILE = os.path.join(SETTINGS_DIR, "homepod_link.log")
 
 DEFAULTS = {
-    "latency_ms": 500,
+    "latency_ms": 250,
     "volume": 50,
     "protocol": "AirPlay 2",
     "last_devices": [],
@@ -50,6 +50,7 @@ DEFAULTS = {
     "swap_lr": False,
     "rainbow": True,
     "auto_fix": True,
+    "settings_rev": 2,
 }
 
 # ---------------------------------------------------------------- settings --
@@ -59,7 +60,12 @@ def load_settings():
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {**DEFAULTS, **data}
+        merged = {**DEFAULTS, **data}
+        if data.get("settings_rev", 1) < 2:
+            # v0.6 cut the default delay; move old 500 ms installs to the new default
+            merged["latency_ms"] = min(merged["latency_ms"], DEFAULTS["latency_ms"])
+            merged["settings_rev"] = 2
+        return merged
     except Exception:
         return dict(DEFAULTS)
 
@@ -78,16 +84,34 @@ def save_settings(s):
 # AirPlay 2 receivers advertise a minimum of 11025 samples (250 ms).
 
 LATENCY_MS = {"value": DEFAULTS["latency_ms"]}
+MIN_DELAY_MS = 100
 _orig_reset = StreamContext.reset
 
 
 def _patched_reset(self):
     _orig_reset(self)
-    ms = max(250, min(2000, int(LATENCY_MS["value"])))
+    ms = max(MIN_DELAY_MS, min(2000, int(LATENCY_MS["value"])))
     self.latency = int(self.sample_rate * ms / 1000)
 
 
 StreamContext.reset = _patched_reset
+
+# pyatv tells the HomePod we never go below 250 ms. Advertise our real minimum.
+from pyatv.support.rtsp import RtspSession  # noqa: E402
+
+_orig_rtsp_setup = RtspSession.setup
+
+
+async def _patched_rtsp_setup(self, *args, **kwargs):
+    body = kwargs.get("body")
+    if isinstance(body, dict):
+        for st in body.get("streams", []):
+            if "latencyMin" in st:
+                st["latencyMin"] = int(SAMPLE_RATE * MIN_DELAY_MS / 1000)
+    return await _orig_rtsp_setup(self, *args, **kwargs)
+
+
+RtspSession.setup = _patched_rtsp_setup
 
 # ------------------------------------------------------------- audio source --
 
@@ -100,7 +124,7 @@ class Timeline:
     matter when each one connected."""
 
     SECONDS = 8
-    READ_DELAY = 0.12  # read audio captured ~120 ms ago, so it has surely arrived
+    READ_DELAY = 0.05  # read audio captured ~50 ms ago (auto-raised if it arrives late)
     SNAP = 0.25  # only jump if more than 250 ms off (after silence, hiccups)
     NUDGE = 2  # otherwise correct gently: at most 2 samples per block (inaudible)
     DEADBAND = 0.012  # ignore normal jitter under 12 ms
@@ -322,7 +346,7 @@ class LoopbackCapture(threading.Thread):
                 self.device_name = speaker.name
                 mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
                 self.log(f"Capturing from: {speaker.name}")
-                block = 441  # 10 ms blocks keep capture latency low
+                block = 220  # 5 ms blocks keep capture latency low
                 with mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS, blocksize=block) as rec:
                     checks = 0
                     while not self._stop_evt.is_set():
@@ -523,6 +547,7 @@ class Backend:
         last_lost = dict(LOST)
         last_late = {}
         bad_windows = 0
+        clean_windows = 0
         while my_gen == self.gen:
             await asyncio.sleep(10)
             if my_gen != self.gen or not self.auto_fix:
@@ -539,12 +564,18 @@ class Backend:
                 late = sess.buf.underruns - last_late.get(sess.name, 0)
                 last_late[sess.name] = sess.buf.underruns
                 if late > 3 and Timeline.READ_DELAY < 0.3:
-                    Timeline.READ_DELAY = round(Timeline.READ_DELAY + 0.03, 3)
+                    Timeline.READ_DELAY = round(Timeline.READ_DELAY + 0.02, 3)
                     self.log(f"Auto-fix: PC audio arriving late - reading {Timeline.READ_DELAY * 1000:.0f} ms back")
             last_lost = dict(LOST)
             bad_windows = bad_windows + 1 if worst > 0.02 else 0
+            clean_windows = clean_windows + 1 if worst == 0 else 0
+            if clean_windows == 18 and LATENCY_MS["value"] > MIN_DELAY_MS and self.on_delay_change:
+                # 3 clean minutes: try 25 ms less next time Play is pressed (no interruption now)
+                lower = max(MIN_DELAY_MS, LATENCY_MS["value"] - 25)
+                self.log(f"Auto-tune: 3 clean minutes - next Play will use {lower} ms")
+                self.on_delay_change(lower, apply_now=False)
             if bad_windows >= 2 and LATENCY_MS["value"] < 2000 and self._last_args:
-                new = min(2000, LATENCY_MS["value"] + 250)
+                new = min(2000, LATENCY_MS["value"] + 100)
                 self.log(f"Auto-fix: sound was choppy for 20 s - raising delay to {new} ms and reconnecting")
                 LATENCY_MS["value"] = new
                 if self.on_delay_change:
@@ -826,7 +857,9 @@ class App:
 
         self.backend = Backend(self.log, self.set_status)
         self.backend.auto_fix = self.auto_fix.get()
-        self.backend.on_delay_change = lambda v: self.root.after(0, lambda: self._delay_changed(v))
+        self.backend.on_delay_change = lambda v, apply_now=True: self.root.after(
+            0, lambda: self._delay_changed(v, apply_now)
+        )
         self.log(
             f"{APP_NAME} {APP_VERSION} build {BUILD_NUMBER} | {platform.platform()} | "
             f"Python {platform.python_version()} | pyatv {pyatv.const.__version__}"
@@ -894,8 +927,8 @@ class App:
         lbl(lrow, "Delay", 11).pack(side="left")
         self.lat_lbl = lbl(lrow, f"{self.lat.get()} ms", 11, bold=True)
         self.lat_lbl.pack(side="right")
-        Slider(sc.inner, self.lat, 250, 2000, th, step=50, command=self.on_latency, rainbow=rb).pack(fill="x", padx=4)
-        lbl(sc.inner, "Lower = less lag. Raise it if sound cuts out. Applies when you press Play.",
+        Slider(sc.inner, self.lat, MIN_DELAY_MS, 2000, th, step=25, command=self.on_latency, rainbow=rb).pack(fill="x", padx=4)
+        lbl(sc.inner, "Lower = less lag. With Auto-fix on, the app finds the lowest smooth delay by itself.",
             9, "sub", wraplength=360, justify="left").pack(anchor="w", padx=12, pady=(2, 8))
 
         # toggles
@@ -1021,11 +1054,14 @@ class App:
         self.settings["auto_fix"] = self.auto_fix.get()
         save_settings(self.settings)
 
-    def _delay_changed(self, v):
-        self.lat.set(v)
+    def _delay_changed(self, v, apply_now=True):
         self.settings["latency_ms"] = v
         save_settings(self.settings)
-        self.build()
+        if apply_now:
+            self.lat.set(v)
+            self.build()
+        else:
+            self._pending_delay = v  # used on next Play; doesn't interrupt the stream
 
     # -------------------------------------------------------------- theme --
     def on_theme(self):
@@ -1141,8 +1177,12 @@ class App:
             if self.split.get():
                 self.log("Stereo pair needs exactly 2 speakers - playing full stereo on each")
             channels = ["both"] * len(names)
+        if getattr(self, "_pending_delay", None) is not None:
+            self.lat.set(self._pending_delay)
+            self._pending_delay = None
+            self.build()
         LATENCY_MS["value"] = self.lat.get()
-        Timeline.READ_DELAY = 0.12
+        Timeline.READ_DELAY = 0.05
         self.settings.update(
             last_devices=names,
             latency_ms=self.lat.get(),
@@ -1196,8 +1236,9 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def on_close(self):
+        pending = getattr(self, "_pending_delay", None)
         self.settings.update(
-            latency_ms=self.lat.get(),
+            latency_ms=pending if pending is not None else self.lat.get(),
             protocol=self.proto.get(),
             volume=self.vol.get(),
             stereo_split=self.split.get(),
