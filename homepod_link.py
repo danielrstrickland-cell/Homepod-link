@@ -29,7 +29,9 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
+BUILD_NUMBER = 0  # stamped by the GitHub build
+REPO = "danielrstrickland-cell/Homepod-link"
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_SAMPLE = 2
@@ -501,6 +503,66 @@ class Backend:
             self.on_status("Disconnected")
 
 
+# ------------------------------------------------------------------ updates --
+
+
+def fetch_latest_release():
+    """Return (build_number, exe_url, release_name) of the newest GitHub release."""
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{REPO}/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "HomePodLink"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        rel = json.load(r)
+    tag = rel.get("tag_name", "")
+    num = int(tag.split("-")[-1]) if tag.split("-")[-1].isdigit() else 0
+    url = next(
+        (a["browser_download_url"] for a in rel.get("assets", []) if a["name"].lower().endswith(".exe")),
+        None,
+    )
+    return num, url, rel.get("name") or tag
+
+
+def download_and_restart(url, log):
+    """Download the new exe next to this one, then swap it in and relaunch."""
+    import subprocess
+    import tempfile
+    import urllib.request
+
+    exe = sys.executable
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Updating only works from the .exe")
+    new_path = exe + ".new"
+    req = urllib.request.Request(url, headers={"User-Agent": "HomePodLink"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(new_path, "wb") as f:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+    if os.path.getsize(new_path) < 1_000_000:
+        raise RuntimeError("Download looks incomplete")
+    log(f"Downloaded update ({os.path.getsize(new_path) // 1_000_000} MB), restarting")
+    bat = os.path.join(tempfile.gettempdir(), "homepodlink_update.bat")
+    with open(bat, "w") as f:
+        f.write(
+            "@echo off\r\n"
+            f"set PID={os.getpid()}\r\n"
+            ":wait\r\n"
+            'tasklist /FI "PID eq %PID%" | find "%PID%" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n'
+            f'move /Y "{new_path}" "{exe}" >nul\r\n'
+            f'start "" "{exe}"\r\n'
+            'del "%~f0"\r\n'
+        )
+    subprocess.Popen(
+        ["cmd", "/c", bat],
+        creationflags=0x08000000 | 0x00000008,  # CREATE_NO_WINDOW | DETACHED_PROCESS
+        close_fds=True,
+    )
+
+
 # ----------------------------------------------------------------------- UI --
 
 RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
@@ -600,6 +662,8 @@ class App:
         lhead.pack(fill="x", padx=12)
         ttk.Label(lhead, text="Log").pack(side="left")
         ttk.Button(lhead, text="Copy log", command=self.copy_log).pack(side="right")
+        self.btn_update = ttk.Button(lhead, text="Check for update", command=self.on_update)
+        self.btn_update.pack(side="right", padx=(0, 6))
         self.log_box = tk.Text(root, height=10, wrap="word", font=("Consolas", 8))
         self.log_box.pack(fill="both", expand=True, padx=12, pady=(4, 8))
 
@@ -612,7 +676,7 @@ class App:
 
         self.backend = Backend(self.log, self.set_status)
         self.log(
-            f"{APP_NAME} {APP_VERSION} | {platform.platform()} | "
+            f"{APP_NAME} {APP_VERSION} build {BUILD_NUMBER} | {platform.platform()} | "
             f"Python {platform.python_version()} | pyatv {pyatv.const.__version__}"
         )
         self.root.after(100, self._drain_log)
@@ -650,7 +714,7 @@ class App:
             self.btn_disconnect.configure(style="Blue.TButton")
             self.btn_rescan.configure(style="Green.TButton")
             self.dev_list.configure(selectbackground=PURPLE, selectforeground="white")
-            self.root.title(f"{APP_NAME} {APP_VERSION} \U0001F308")
+            self.root.title(f"{APP_NAME} {APP_VERSION} (build {BUILD_NUMBER}) \U0001F308")
             height = 8
         else:
             s.theme_use("clam")
@@ -663,7 +727,7 @@ class App:
             for b in (self.btn_connect, self.btn_disconnect, self.btn_rescan):
                 b.configure(style="TButton")
             self.dev_list.configure(selectbackground="#0078D7", selectforeground="white")
-            self.root.title(f"{APP_NAME} {APP_VERSION}")
+            self.root.title(f"{APP_NAME} {APP_VERSION} (build {BUILD_NUMBER})")
             height = 0
         s.configure("Value.TLabel", font=("Segoe UI", 11, "bold"))
         for c in (self.top_stripe, self.bottom_stripe):
@@ -780,6 +844,28 @@ class App:
         v = int(round(float(self.lat.get()) / 50) * 50)
         self.lat.set(v)
         self.lat_lbl.config(text=str(v))
+
+    def on_update(self):
+        self.btn_update.configure(state="disabled")
+        self.set_status("Checking for updates...")
+
+        def work():
+            try:
+                num, url, name = fetch_latest_release()
+                self.log(f"Latest release: {name} (this is build {BUILD_NUMBER})")
+                if num <= BUILD_NUMBER or not url:
+                    self.set_status(f"You're up to date (build {BUILD_NUMBER})")
+                    return
+                self.set_status(f"Downloading build {num}...")
+                download_and_restart(url, self.log)
+                self.root.after(0, self.on_close)
+            except Exception as ex:
+                self.log(f"Update failed: {ex!r}")
+                self.set_status("Update failed - see log")
+            finally:
+                self.root.after(0, lambda: self.btn_update.configure(state="normal"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def on_close(self):
         self.settings.update(

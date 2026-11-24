@@ -23,6 +23,8 @@ The first time it runs, allow it through the Windows Firewall on **Private netwo
 6. **Rainbow theme** switches between the rainbow look and the plain Windows look. It's remembered between launches.
 7. **Mode** is AirPlay 2 by default. Auto and AirPlay 1 are there for troubleshooting.
 
+**Check for update** (next to Copy log) downloads the newest build from GitHub and restarts the app on it.
+
 If it won't connect, hit **Copy log** and send the log.
 
 The full debug log is saved at `%APPDATA%\HomePodLink\homepod_link.log`.
