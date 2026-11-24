@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -43,7 +43,7 @@ SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 LOG_FILE = os.path.join(SETTINGS_DIR, "homepod_link.log")
 
 DEFAULTS = {
-    "latency_ms": 250,
+    "latency_ms": 300,
     "volume": 50,
     "protocol": "AirPlay 2",
     "last_devices": [],
@@ -63,7 +63,7 @@ DEFAULTS = {
     "viz_style": "Bars",
     "viz_colors": "Theme",
     "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
-    "settings_rev": 2,
+    "settings_rev": 3,
 }
 
 # ---------------------------------------------------------------- settings --
@@ -74,6 +74,9 @@ def load_settings():
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         merged = {**DEFAULTS, **data}
+        if data.get("settings_rev", 1) < 3:
+            merged["latency_ms"] = max(300, min(merged["latency_ms"], 500))
+            merged["settings_rev"] = 3
         if data.get("settings_rev", 1) < 2:
             # v0.6 cut the default delay; move old 500 ms installs to the new default
             merged["latency_ms"] = min(merged["latency_ms"], DEFAULTS["latency_ms"])
@@ -126,6 +129,76 @@ async def _patched_rtsp_setup(self, *args, **kwargs):
 
 RtspSession.setup = _patched_rtsp_setup
 
+# ---- Timing fixes for pyatv's sender ------------------------------------------
+# 1) pyatv starts the stream clock, then spends 100-300 ms on RECORD/FLUSH/metadata
+#    before the first packet. Every packet then arrives that much later than its
+#    play time, eating the buffer (choppy) by a different amount per speaker
+#    (out of sync). We re-anchor the clock at the moment audio really starts.
+# 2) Its sync packets are stamped from the sample counter, not the real clock, so
+#    sender jitter tells each HomePod a slightly wrong timeline. We stamp them with
+#    the real clock.
+# 3) Each packet carries the audio captured exactly "delay" before it will play,
+#    so every speaker plays the same moment at the same time.
+import contextvars  # noqa: E402
+
+from pyatv.protocols.raop import timing as _timing  # noqa: E402
+from pyatv.protocols.raop.packets import SyncPacket as _SyncPacket  # noqa: E402
+from pyatv.protocols.raop import stream_client as _sc0  # noqa: E402
+
+SESSION = contextvars.ContextVar("homepod_session", default=None)
+CONTEXTS = {}  # speaker name -> StreamContext of its live stream
+_reset_with_latency = StreamContext.reset
+
+
+def _reset_and_register(self):
+    _reset_with_latency(self)
+    name = SESSION.get()
+    if name:
+        CONTEXTS[name] = self
+
+
+StreamContext.reset = _reset_and_register
+_orig_stream_data = _sc0.StreamClient._stream_data
+
+
+async def _anchored_stream_data(self, source, transport):
+    ctx = self.context
+    now_ts = _timing.ntp2ts(_timing.ntp_now(), ctx.sample_rate)
+    shift = now_ts - ctx.head_ts  # setup time that passed since reset()
+    ctx.start_ts += shift
+    ctx.head_ts += shift  # rtptime (head - start + latency) is unchanged
+    return await _orig_stream_data(self, source, transport)
+
+
+_sc0.StreamClient._stream_data = _anchored_stream_data
+
+
+async def _realtime_sync_task(self, dest):
+    if self.transport is None:
+        raise RuntimeError("socket not connected")
+    first = True
+    ctx = self.context
+    while self.transport is not None:
+        now = _timing.ntp_now()
+        playing = _timing.ntp2ts(now, ctx.sample_rate) - ctx.start_ts  # rtp playing right now
+        sec, frac = _timing.ntp2parts(now)
+        packet = _SyncPacket.encode(0x90 if first else 0x80, 0xD4, 0x0007,
+                                    playing & 0xFFFFFFFF, sec, frac,
+                                    (playing + ctx.latency) & 0xFFFFFFFF)
+        first = False
+        self.transport.sendto(packet, dest)
+        await asyncio.sleep(1.0)
+
+
+_sc0.ControlClient._sync_task = _realtime_sync_task
+_MONO_OFFSET = time.time() - time.monotonic()
+
+
+def ctx_play_mono(ctx):
+    """Monotonic time at which the packet about to be sent will play."""
+    ntp_secs = (ctx.head_ts + ctx.latency) / ctx.sample_rate
+    return ntp_secs - 0x83AA7E80 - _MONO_OFFSET
+
 # Security: AirPlay 2 encrypts every audio packet (ChaCha20-Poly1305, key from the
 # per-session X25519 pairing). Refuse to send anything if encryption isn't active.
 from pyatv.protocols.raop.protocols import airplayv2 as _ap2  # noqa: E402
@@ -152,7 +225,7 @@ class Timeline:
     matter when each one connected."""
 
     SECONDS = 8
-    READ_DELAY = 0.05  # read audio captured ~50 ms ago (auto-raised if it arrives late)
+    READ_DELAY = 0.08  # read audio captured ~80 ms ago (auto-raised if it arrives late)
     SNAP = 0.25  # only jump if more than 250 ms off (after silence, hiccups)
     NUDGE = 2  # otherwise correct gently: at most 2 samples per block (inaudible)
     DEADBAND = 0.012  # ignore normal jitter under 12 ms
@@ -235,8 +308,9 @@ TIMELINE = Timeline()
 class LiveBuffer:
     """Per-speaker reader on the shared timeline (keeps the old name/interface)."""
 
-    def __init__(self, channel="both"):
+    def __init__(self, channel="both", name=None):
         self.channel = channel  # "both", "left" or "right"
+        self.name = name
         self.pos = None
         self.dropped = 0  # resyncs (times we jumped to stay in time)
         self.underruns = 0  # reads where audio hadn't arrived yet
@@ -247,7 +321,15 @@ class LiveBuffer:
 
     def pop(self, nbytes: int) -> bytes:
         n = nbytes // FRAME_BYTES
-        target = TIMELINE.now_pos() - int(Timeline.READ_DELAY * SAMPLE_RATE)
+        ctx = CONTEXTS.get(self.name) if self.name else None
+        if ctx is not None:
+            # Exact: the audio captured (delay + read margin) before this packet plays.
+            delay = ctx.latency / ctx.sample_rate
+            target = TIMELINE.now_pos(ctx_play_mono(ctx) - delay) - int(Timeline.READ_DELAY * SAMPLE_RATE)
+            if self.pos is not None and abs(self.pos - target) <= Timeline.SNAP * SAMPLE_RATE:
+                self.pos = target  # follows the stream clock exactly; no drift possible
+        else:
+            target = TIMELINE.now_pos() - int(Timeline.READ_DELAY * SAMPLE_RATE)
         if self.pos is None or abs(self.pos - target) > Timeline.SNAP * SAMPLE_RATE:
             if self.pos is not None:
                 self.dropped += 1
@@ -393,7 +475,7 @@ class LoopbackCapture(threading.Thread):
                 following_default = not self.source or label == sc.default_speaker().name
                 self.device_name = sc.default_speaker().name
                 self.log(f"Capturing from: {label}")
-                block = 220  # 5 ms blocks keep capture latency low
+                block = 441  # 10 ms blocks: low latency without capture dropouts
                 with mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS, blocksize=block) as rec:
                     checks = 0
                     while not self._stop_evt.is_set():
@@ -684,7 +766,7 @@ class Session:
     def __init__(self, name, channel):
         self.name = name
         self.channel = channel
-        self.buf = LiveBuffer(channel=channel)
+        self.buf = LiveBuffer(channel=channel, name=name)
         self.atv = None
         self.playing = False
 
@@ -830,9 +912,11 @@ class Backend:
 
         confirm_task = asyncio.ensure_future(confirm())
         try:
+            SESSION.set(sess.name)
             await sess.atv.stream.stream_file(LIVE_SENTINEL + sess.name)
         finally:
             confirm_task.cancel()
+            CONTEXTS.pop(sess.name, None)
         secs = max(0.1, time.monotonic() - started)
         self.log(
             f"{sess.name}: stream ended after {secs:.1f} s "
@@ -874,14 +958,14 @@ class Backend:
                     Timeline.READ_DELAY = round(Timeline.READ_DELAY + 0.02, 3)
                     self.log(f"Auto-fix: PC audio arriving late - reading {Timeline.READ_DELAY * 1000:.0f} ms back")
             last_lost = dict(LOST)
-            bad_windows = bad_windows + 1 if worst > 0.02 else 0
+            bad_windows = bad_windows + 1 if worst > 0.01 else 0
             clean_windows = clean_windows + 1 if worst == 0 else 0
-            if clean_windows == 18 and LATENCY_MS["value"] > MIN_DELAY_MS and self.on_delay_change:
+            if clean_windows == 18 and LATENCY_MS["value"] > 150 and self.on_delay_change:
                 # 3 clean minutes: try 25 ms less next time Play is pressed (no interruption now)
-                lower = max(MIN_DELAY_MS, LATENCY_MS["value"] - 25)
+                lower = max(150, LATENCY_MS["value"] - 25)
                 self.log(f"Auto-tune: 3 clean minutes - next Play will use {lower} ms")
                 self.on_delay_change(lower, apply_now=False)
-            if bad_windows >= 2 and LATENCY_MS["value"] < 2000 and self._last_args:
+            if bad_windows >= 1 and LATENCY_MS["value"] < 2000 and self._last_args:
                 new = min(2000, LATENCY_MS["value"] + 100)
                 self.log(f"Auto-fix: sound was choppy for 20 s - raising delay to {new} ms and reconnecting")
                 LATENCY_MS["value"] = new
@@ -1346,6 +1430,7 @@ class App:
         if self.body is not None:
             self.body.destroy()
         self.log_box = None
+        self._ui_gen = getattr(self, "_ui_gen", 0) + 1  # stops loops from older layouts
         rb = self.rainbow.get()
         th = self.th = THEMES["rainbow" if rb else "plain"]
         self.root.configure(bg=th["bg"])
@@ -1506,6 +1591,7 @@ class App:
             (VIZ_STYLES.index(self.settings.get("viz_style", "Bars")) + 1) % len(VIZ_STYLES)]))
         self._viz_levels = np.zeros(32)
         self._viz_peaks = np.zeros(32)
+        self._viz_items = None
 
         def chips(parent, key, options, current):
             row = tk.Frame(parent, bg=th["card"])
@@ -1519,7 +1605,7 @@ class App:
 
         chips(vc.inner, "viz_style", VIZ_STYLES, self.settings.get("viz_style", "Bars"))
         chips(vc.inner, "viz_colors", list(VIZ_PALETTES), self.settings.get("viz_colors", "Theme"))
-        self._viz_tick()
+        self._viz_tick(self._ui_gen)
 
         # equalizer
         lbl(wrap, "EQUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
@@ -1569,7 +1655,7 @@ class App:
         self.eqc.bind("<Button-1>", self._eq_drag)
         self.eqc.bind("<B1-Motion>", self._eq_drag)
         self.eqc.bind("<Double-Button-1>", self._eq_reset_band)
-        self._eq_refresh()
+        self._eq_refresh(self._ui_gen)
 
     def _eq_geom(self):
         w = self.eqc.winfo_width()
@@ -1675,9 +1761,9 @@ class App:
         self._eq_save_later()
         self.build()
 
-    def _eq_refresh(self):
+    def _eq_refresh(self, gen):
         """Keep the sliders and style label live while Smart EQ is steering."""
-        if self.page != "sound":
+        if self.page != "sound" or gen != self._ui_gen:
             return
         try:
             if self.smart_eq.get():
@@ -1687,11 +1773,12 @@ class App:
                 self.style_lbl.config(text="")
         except tk.TclError:
             return
-        self.root.after(1000, self._eq_refresh)
+        self.root.after(1000, lambda: self._eq_refresh(gen))
 
-    def _viz_tick(self):
-        if self.page != "sound":
+    def _viz_tick(self, gen):
+        if self.page != "sound" or gen != self._ui_gen:
             return
+        t_start = time.perf_counter()
         try:
             cv = self.viz
             w = cv.winfo_width()
@@ -1723,9 +1810,11 @@ class App:
         def col(i, n=32):
             return pal[min(len(pal) - 1, i * len(pal) // n)]
 
-        cv.delete("all")
         bw = w / 32
         lv = self._viz_levels
+        if style != "Dots":
+            cv.delete("all")
+            self._viz_items = None
         if style == "Bars":
             for i, v in enumerate(lv):
                 bh = max(3, v * (h - 6))
@@ -1746,16 +1835,29 @@ class App:
             cv.create_polygon(flat, smooth=True, fill=col(16), outline="", stipple="gray50")
             cv.create_line(flat[2:-2], smooth=True, fill=col(4), width=3)
         elif style == "Dots":
-            rows = max(4, int(h // 12))
+            rows = int(max(4, min(16, h // 14)))
+            key = ("dots", w, h, rows)
+            if self._viz_items is None or self._viz_items[0] != key:
+                cv.delete("all")
+                grid = []
+                rr = min(bw, h / rows) * 0.32
+                for i in range(32):
+                    colm = []
+                    for r in range(rows):
+                        y = h - (r + 0.5) * (h / rows)
+                        cx = (i + 0.5) * bw
+                        colm.append(cv.create_oval(cx - rr, y - rr, cx + rr, y + rr, fill=self.th["off"], outline=""))
+                    grid.append(colm)
+                self._viz_items = (key, grid, [0] * 32)
+            _, grid, lit_prev = self._viz_items
             for i, v in enumerate(lv):
                 lit = int(round(v * rows))
-                for r in range(rows):
-                    y = h - (r + 0.5) * (h / rows)
-                    rr = min(bw, h / rows) * 0.32
-                    cx = (i + 0.5) * bw
-                    on = r < lit
-                    cv.create_oval(cx - rr, y - rr, cx + rr, y + rr,
-                                   fill=col(i) if on else self.th["off"], outline="")
+                if lit != lit_prev[i]:
+                    lo, hi = sorted((lit, lit_prev[i]))
+                    for r in range(lo, hi):
+                        cv.itemconfigure(grid[i][r], fill=col(i) if r < lit else self.th["off"])
+                    lit_prev[i] = lit
+            self._viz_items = (key, grid, lit_prev)
         else:  # Scope: the actual waveform
             seg = x[-1024:]
             peak = max(0.05, float(np.max(np.abs(seg))))
@@ -1763,7 +1865,9 @@ class App:
             for j in range(0, 1024, 8):
                 pts += [j / 1024 * w, h / 2 - seg[j] / peak * (h / 2 - 4)]
             cv.create_line(pts, fill=col(8), width=2, smooth=True)
-        self.root.after(33, self._viz_tick)
+        # adaptive frame rate: never let drawing hog the window
+        cost_ms = (time.perf_counter() - t_start) * 1000
+        self.root.after(int(max(33, cost_ms * 4)), lambda: self._viz_tick(gen))
 
     def _viz_resize(self, e):
         y0, h0 = getattr(self, "_viz_drag", (e.y_root, self.viz_h))
@@ -2071,7 +2175,7 @@ class App:
             self._pending_delay = None
             self.build()
         LATENCY_MS["value"] = self.lat.get()
-        Timeline.READ_DELAY = 0.05
+        Timeline.READ_DELAY = 0.08
         self.settings.update(
             last_devices=names,
             latency_ms=self.lat.get(),
