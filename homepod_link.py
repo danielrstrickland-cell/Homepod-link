@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.2.0"
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_SAMPLE = 2
@@ -39,7 +39,15 @@ SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), 
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 LOG_FILE = os.path.join(SETTINGS_DIR, "homepod_link.log")
 
-DEFAULTS = {"latency_ms": 500, "volume": 50, "protocol": "AirPlay 2", "last_device": ""}
+DEFAULTS = {
+    "latency_ms": 500,
+    "volume": 50,
+    "protocol": "AirPlay 2",
+    "last_devices": [],
+    "stereo_split": False,
+    "swap_lr": False,
+    "rainbow": True,
+}
 
 # ---------------------------------------------------------------- settings --
 
@@ -84,7 +92,8 @@ StreamContext.reset = _patched_reset
 class LiveBuffer:
     """Thread-safe PCM buffer between the capture thread and the sender."""
 
-    def __init__(self, max_ms=200):
+    def __init__(self, max_ms=200, channel="both"):
+        self.channel = channel  # "both", "left" or "right"
         self._lock = threading.Lock()
         self._buf = bytearray()
         self.max_bytes = int(SAMPLE_RATE * max_ms / 1000) * FRAME_BYTES
@@ -151,14 +160,14 @@ class LiveSource(AudioSource):
         return 0
 
 
-LIVE_SENTINEL = "__homepod_link_live__"
+LIVE_SENTINEL = "__homepod_link_live__:"
 _orig_open_source = raop_mod.open_source
-_live_holder = {"source": None}
+_live_sources = {}  # speaker name -> LiveSource
 
 
 async def _patched_open_source(source, sample_rate, channels, sample_size):
-    if isinstance(source, str) and source == LIVE_SENTINEL:
-        return _live_holder["source"]
+    if isinstance(source, str) and source.startswith(LIVE_SENTINEL):
+        return _live_sources[source[len(LIVE_SENTINEL):]]
     return await _orig_open_source(source, sample_rate, channels, sample_size)
 
 
@@ -168,25 +177,52 @@ raop_mod.open_source = _patched_open_source
 
 
 class LoopbackCapture(threading.Thread):
-    """Records the default Windows output device via WASAPI loopback."""
+    """Records the default Windows output via WASAPI loopback and fans the
+    audio out to every connected speaker's buffer."""
 
-    def __init__(self, buf: LiveBuffer, log):
+    def __init__(self, log):
         super().__init__(daemon=True)
-        self.buf = buf
         self.log = log
         self._stop_evt = threading.Event()
+        self._lock = threading.Lock()
+        self.buffers = []
         self.device_name = "?"
-        self.error = None
+
+    def add(self, buf):
+        with self._lock:
+            self.buffers.append(buf)
+
+    def remove(self, buf):
+        with self._lock:
+            if buf in self.buffers:
+                self.buffers.remove(buf)
 
     def stop(self):
         self._stop_evt.set()
+
+    def _fan_out(self, data):
+        with self._lock:
+            bufs = list(self.buffers)
+        if not bufs:
+            return
+        cache = {}
+        for buf in bufs:
+            if buf.channel not in cache:
+                if buf.channel == "left":
+                    d = np.column_stack([data[:, 0], data[:, 0]])
+                elif buf.channel == "right":
+                    d = np.column_stack([data[:, 1], data[:, 1]])
+                else:
+                    d = data
+                # AirPlay wants big-endian 16-bit PCM
+                cache[buf.channel] = (np.clip(d, -1.0, 1.0) * 32767).astype(">i2").tobytes()
+            buf.push(cache[buf.channel])
 
     def run(self):
         try:
             import soundcard as sc  # imported here so errors land in the log
         except Exception as ex:
-            self.error = f"Audio capture library failed to load: {ex}"
-            self.log(self.error)
+            self.log(f"Audio capture library failed to load: {ex}")
             return
         while not self._stop_evt.is_set():
             try:
@@ -196,6 +232,7 @@ class LoopbackCapture(threading.Thread):
                 self.log(f"Capturing from: {speaker.name}")
                 block = 441  # 10 ms blocks keep capture latency low
                 with mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS, blocksize=block) as rec:
+                    checks = 0
                     while not self._stop_evt.is_set():
                         data = rec.record(numframes=block)
                         if data.ndim == 1:
@@ -204,12 +241,13 @@ class LoopbackCapture(threading.Thread):
                             data = np.repeat(data, 2, axis=1)
                         elif data.shape[1] > 2:
                             data = data[:, :2]
-                        pcm = (np.clip(data, -1.0, 1.0) * 32767).astype(">i2").tobytes()
-                        self.buf.push(pcm)
-                        # Restart if the user switched default output device.
-                        if sc.default_speaker().name != self.device_name:
-                            self.log("Default output changed, restarting capture")
-                            break
+                        self._fan_out(data)
+                        checks += 1
+                        if checks >= 100:  # about once a second
+                            checks = 0
+                            if sc.default_speaker().name != self.device_name:
+                                self.log("Default output changed, restarting capture")
+                                break
             except Exception as ex:
                 self.log(f"Capture error: {ex!r} - retrying in 2 s")
                 time.sleep(2)
@@ -218,8 +256,17 @@ class LoopbackCapture(threading.Thread):
 # ------------------------------------------------------------------ backend --
 
 
+class Session:
+    def __init__(self, name, channel):
+        self.name = name
+        self.channel = channel
+        self.buf = LiveBuffer(channel=channel)
+        self.atv = None
+        self.playing = False
+
+
 class Backend:
-    """Runs pyatv on its own asyncio loop thread."""
+    """Runs pyatv on its own asyncio loop thread. One Session per speaker."""
 
     def __init__(self, log, on_status):
         self.log = log
@@ -227,13 +274,9 @@ class Backend:
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self._run_loop, daemon=True).start()
         self.devices = {}
-        self.atv = None
-        self.stream_task = None
+        self.sessions = {}
         self.capture = None
-        self.buf = LiveBuffer()
-        self.connected_name = None
-        self.want_connected = False
-        self.gen = 0  # bumps on every Connect/Disconnect so old retry loops quit
+        self.gen = 0  # bumps on every Connect/Disconnect so old loops quit
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -241,6 +284,18 @@ class Backend:
 
     def submit(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def _report(self):
+        if not self.sessions:
+            return
+        playing = [s.name for s in self.sessions.values() if s.playing]
+        waiting = [s.name for s in self.sessions.values() if not s.playing]
+        parts = []
+        if playing:
+            parts.append("Playing on " + " + ".join(playing))
+        if waiting:
+            parts.append("connecting " + " + ".join(waiting))
+        self.on_status(" | ".join(parts))
 
     async def scan(self):
         self.on_status("Scanning for speakers...")
@@ -266,42 +321,56 @@ class Backend:
         self.on_status(f"Found {len(found)} speaker(s)")
         return sorted(self.devices.keys())
 
-    async def connect(self, name, protocol_label, volume):
+    async def connect(self, names, channels, protocol_label, volume):
+        """names: speakers to play on; channels: matching list of both/left/right."""
         await self.disconnect(quiet=True)
-        conf = self.devices.get(name)
-        if conf is None:
-            self.on_status("Speaker not found - rescan")
-            return
         self.gen += 1
         my_gen = self.gen
-        self.want_connected = True
+        if self.capture is None or not self.capture.is_alive():
+            self.capture = LoopbackCapture(self.log)
+            self.capture.start()
+        tasks = []
+        for name, channel in zip(names, channels):
+            if name not in self.devices:
+                self.log(f"{name} not found - rescan")
+                continue
+            sess = Session(name, channel)
+            self.sessions[name] = sess
+            tasks.append(self._speaker_loop(sess, protocol_label, volume, my_gen))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _speaker_loop(self, sess, protocol_label, volume, my_gen):
         attempt = 0
-        while self.want_connected and my_gen == self.gen:
+        while my_gen == self.gen:
             attempt += 1
             try:
-                await self._stream_once(conf, name, protocol_label, volume, attempt)
+                await self._stream_once(sess, protocol_label, volume, attempt, my_gen)
             except asyncio.CancelledError:
                 break
             except Exception as ex:
                 if my_gen != self.gen:
                     return  # user disconnected or switched speakers
-                self.log(f"Stream error: {ex!r}")
+                self.log(f"{sess.name}: stream error: {ex!r}")
                 self.log(traceback.format_exc().strip())
                 cause = ex.__cause__ or ex.__context__
                 if cause:
                     self.log(f"  caused by: {cause!r}")
-            if not self.want_connected or my_gen != self.gen:
+            finally:
+                sess.playing = False
+                if self.capture:
+                    self.capture.remove(sess.buf)
+            if my_gen != self.gen:
                 return
             if attempt >= 5:
-                self.on_status("Couldn't stay connected - copy the log and send it")
-                self.want_connected = False
+                self.on_status(f"{sess.name} couldn't stay connected - copy the log and send it")
                 break
-            self.on_status(f"Dropped - reconnecting ({attempt}/5)...")
+            self.on_status(f"{sess.name} dropped - reconnecting ({attempt}/5)...")
             await asyncio.sleep(2)
-        await self._cleanup()
+        if my_gen == self.gen:
+            self._close_atv(sess)
 
-    async def _stream_once(self, conf, name, protocol_label, volume, attempt):
-        self.on_status(f"Connecting to {name}...")
+    async def _stream_once(self, sess, protocol_label, volume, attempt, my_gen):
+        conf = self.devices[sess.name]
         storage = MemoryStorage()
         settings = await storage.get_settings(conf)
         settings.protocols.raop.protocol_version = {
@@ -309,76 +378,78 @@ class Backend:
             "AirPlay 1": AirPlayVersion.V1,
         }.get(protocol_label, AirPlayVersion.Auto)
         self.log(
-            f"Connect attempt {attempt}: {name}, protocol={protocol_label}, "
-            f"latency={LATENCY_MS['value']} ms"
+            f"Connect attempt {attempt}: {sess.name} ({sess.channel}), "
+            f"protocol={protocol_label}, latency={LATENCY_MS['value']} ms"
         )
-        self.atv = await pyatv.connect(conf, self.loop, protocol=Protocol.RAOP, storage=storage)
-        self.buf.clear()
-        self.buf.dropped = self.buf.underruns = self.buf.captured = 0
-        _live_holder["source"] = LiveSource(self.buf)
-        if self.capture is None or not self.capture.is_alive():
-            self.capture = LoopbackCapture(self.buf, self.log)
-            self.capture.start()
+        self._report()
+        sess.atv = await pyatv.connect(conf, self.loop, protocol=Protocol.RAOP, storage=storage)
+        sess.buf.clear()
+        sess.buf.dropped = sess.buf.underruns = sess.buf.captured = 0
+        _live_sources[sess.name] = LiveSource(sess.buf)
+        self.capture.add(sess.buf)
         try:
-            await self.atv.audio.set_volume(float(volume))
+            await sess.atv.audio.set_volume(float(volume))
         except Exception as ex:
-            self.log(f"Initial volume deferred: {ex!r}")
-        self.connected_name = name
-        self.on_status(f"Pairing with {name}...")
+            self.log(f"{sess.name}: initial volume deferred: {ex!r}")
         started = time.monotonic()
-        my_gen = self.gen
 
         async def confirm():
             await asyncio.sleep(3)
-            if self.connected_name == name and my_gen == self.gen:
-                self.on_status(f"Playing PC audio on {name}")
+            if my_gen == self.gen:
+                sess.playing = True
+                self._report()
 
         confirm_task = asyncio.ensure_future(confirm())
         try:
-            await self.atv.stream.stream_file(LIVE_SENTINEL)
+            await sess.atv.stream.stream_file(LIVE_SENTINEL + sess.name)
         finally:
             confirm_task.cancel()
+        secs = max(0.1, time.monotonic() - started)
         self.log(
-            f"Stream ended after {time.monotonic() - started:.1f} s "
-            f"(underruns={self.buf.underruns}, dropped frames={self.buf.dropped}, "
-            f"capture rate={self.buf.captured / max(0.1, time.monotonic() - started):.0f} Hz)"
+            f"{sess.name}: stream ended after {secs:.1f} s "
+            f"(underruns={sess.buf.underruns}, dropped frames={sess.buf.dropped}, "
+            f"capture rate={sess.buf.captured / secs:.0f} Hz)"
         )
         if my_gen == self.gen:
-            self.connected_name = None
-            if self.atv:
-                self.atv.close()
-                self.atv = None
+            self._close_atv(sess)
 
-    async def set_volume(self, volume):
-        if self.atv and self.connected_name:
+    def _close_atv(self, sess):
+        if sess.atv:
             try:
-                await self.atv.audio.set_volume(float(volume))
-            except Exception as ex:
-                self.log(f"Volume change failed: {ex!r}")
-
-    async def disconnect(self, quiet=False):
-        self.want_connected = False
-        self.gen += 1
-        if self.atv:
-            try:
-                await self.atv.remote_control.stop()
+                sess.atv.close()
             except Exception:
                 pass
-        await self._cleanup()
+            sess.atv = None
+
+    async def set_volume(self, volume):
+        for sess in list(self.sessions.values()):
+            if sess.atv and sess.playing:
+                try:
+                    await sess.atv.audio.set_volume(float(volume))
+                except Exception as ex:
+                    self.log(f"{sess.name}: volume change failed: {ex!r}")
+
+    async def disconnect(self, quiet=False):
+        self.gen += 1
+        sessions = list(self.sessions.values())
+        self.sessions = {}
+        for sess in sessions:
+            if self.capture:
+                self.capture.remove(sess.buf)
+            if sess.atv:
+                try:
+                    await sess.atv.remote_control.stop()
+                except Exception:
+                    pass
+            self._close_atv(sess)
         if not quiet:
             self.on_status("Disconnected")
 
-    async def _cleanup(self):
-        if self.atv:
-            try:
-                self.atv.close()
-            except Exception:
-                pass
-            self.atv = None
-        self.connected_name = None
-
 
 # ----------------------------------------------------------------------- UI --
+
+RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
+PURPLE = "#750787"
 
 
 class App:
@@ -390,27 +461,38 @@ class App:
         self.log_lines = []
         self._setup_file_log()
 
-        root.title(f"{APP_NAME} {APP_VERSION}")
-        root.geometry("420x560")
-        root.minsize(380, 480)
+        self.style = ttk.Style(root)
+        self.default_theme = self.style.theme_use()
+
+        root.geometry("440x640")
+        root.minsize(400, 540)
+
+        self.top_stripe = tk.Canvas(root, height=0, highlightthickness=0, bd=0)
+        self.top_stripe.pack(fill="x")
 
         pad = {"padx": 12, "pady": 4}
-        ttk.Label(root, text="Speakers on your network").pack(anchor="w", **pad)
-        self.dev_list = tk.Listbox(root, height=5, activestyle="none", exportselection=False)
+        ttk.Label(root, text="Speakers on your network (tap one or more)").pack(anchor="w", **pad)
+        self.dev_list = tk.Listbox(
+            root, height=5, activestyle="none", exportselection=False, selectmode="multiple"
+        )
         self.dev_list.pack(fill="x", padx=12)
+
+        srow = ttk.Frame(root)
+        srow.pack(fill="x", **pad)
+        self.split = tk.BooleanVar(value=self.settings["stereo_split"])
+        self.swap = tk.BooleanVar(value=self.settings["swap_lr"])
+        ttk.Checkbutton(srow, text="Stereo pair (left + right)", variable=self.split).pack(side="left")
+        ttk.Checkbutton(srow, text="Swap L/R", variable=self.swap).pack(side="left", padx=(12, 0))
 
         row = ttk.Frame(root)
         row.pack(fill="x", **pad)
-        self.connect_btn = ttk.Button(row, text="Connect", command=self.on_connect)
-        self.connect_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ttk.Button(row, text="Disconnect", command=self.on_disconnect).pack(
-            side="left", expand=True, fill="x", padx=4
-        )
-        ttk.Button(row, text="Rescan", command=self.on_scan).pack(
-            side="left", expand=True, fill="x", padx=(4, 0)
-        )
+        self.btn_connect = ttk.Button(row, text="Connect", command=self.on_connect)
+        self.btn_connect.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self.btn_disconnect = ttk.Button(row, text="Disconnect", command=self.on_disconnect)
+        self.btn_disconnect.pack(side="left", expand=True, fill="x", padx=4)
+        self.btn_rescan = ttk.Button(row, text="Rescan", command=self.on_scan)
+        self.btn_rescan.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        # Volume
         vrow = ttk.Frame(root)
         vrow.pack(fill="x", **pad)
         ttk.Label(vrow, text="Volume", width=9).pack(side="left")
@@ -422,7 +504,6 @@ class App:
         self.vol_lbl.pack(side="left")
         self._vol_job = None
 
-        # Delay
         lrow = ttk.Frame(root)
         lrow.pack(fill="x", **pad)
         ttk.Label(lrow, text="Delay (ms)", width=9).pack(side="left")
@@ -435,11 +516,10 @@ class App:
         ttk.Label(
             root,
             text="Lower = less lag. If sound cuts out, raise it. Applies on next Connect.",
-            foreground="gray",
-            wraplength=390,
+            style="Hint.TLabel",
+            wraplength=400,
         ).pack(anchor="w", padx=12)
 
-        # Protocol
         prow = ttk.Frame(root)
         prow.pack(fill="x", **pad)
         ttk.Label(prow, text="Mode", width=9).pack(side="left")
@@ -451,25 +531,85 @@ class App:
             values=["AirPlay 2", "Auto", "AirPlay 1"],
             width=12,
         ).pack(side="left")
+        self.rainbow = tk.BooleanVar(value=self.settings["rainbow"])
+        ttk.Checkbutton(prow, text="Rainbow theme", variable=self.rainbow, command=self.apply_theme).pack(
+            side="right"
+        )
 
         self.status = tk.StringVar(value="Starting...")
-        ttk.Label(root, textvariable=self.status, wraplength=390, font=("Segoe UI", 10, "bold")).pack(
+        ttk.Label(root, textvariable=self.status, wraplength=400, style="Status.TLabel").pack(
             anchor="w", padx=12, pady=(10, 4)
         )
 
-        # Log
         lhead = ttk.Frame(root)
         lhead.pack(fill="x", padx=12)
         ttk.Label(lhead, text="Log").pack(side="left")
         ttk.Button(lhead, text="Copy log", command=self.copy_log).pack(side="right")
         self.log_box = tk.Text(root, height=10, wrap="word", font=("Consolas", 8))
-        self.log_box.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        self.log_box.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+
+        self.bottom_stripe = tk.Canvas(root, height=0, highlightthickness=0, bd=0)
+        self.bottom_stripe.pack(fill="x", side="bottom", before=lhead)
+        for c in (self.top_stripe, self.bottom_stripe):
+            c.bind("<Configure>", lambda e, c=c: self._draw_stripe(c))
+
+        self.apply_theme()
 
         self.backend = Backend(self.log, self.set_status)
-        self.log(f"{APP_NAME} {APP_VERSION} | {platform.platform()} | Python {platform.python_version()} | pyatv {pyatv.const.__version__}")
+        self.log(
+            f"{APP_NAME} {APP_VERSION} | {platform.platform()} | "
+            f"Python {platform.python_version()} | pyatv {pyatv.const.__version__}"
+        )
         self.root.after(100, self._drain_log)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.on_scan()
+
+    # theme
+    def _draw_stripe(self, canvas):
+        canvas.delete("all")
+        if not self.rainbow.get():
+            return
+        w = max(1, canvas.winfo_width())
+        h = int(canvas.cget("height"))
+        step = w / len(RAINBOW)
+        for i, col in enumerate(RAINBOW):
+            canvas.create_rectangle(i * step, 0, (i + 1) * step + 1, h, fill=col, outline=col)
+
+    def apply_theme(self):
+        on = self.rainbow.get()
+        s = self.style
+        if on:
+            s.theme_use("clam")
+            s.configure(".", font=("Segoe UI", 9))
+            for name, col in (("Red", RAINBOW[0]), ("Blue", RAINBOW[4]), ("Green", RAINBOW[3])):
+                s.configure(f"{name}.TButton", background=col, foreground="white", bordercolor=col)
+                s.map(f"{name}.TButton", background=[("active", PURPLE)])
+            s.configure("Horizontal.TScale", troughcolor="#E9D5F0", background=PURPLE)
+            s.configure("TCheckbutton", indicatorcolor="white")
+            s.map("TCheckbutton", indicatorcolor=[("selected", PURPLE)])
+            s.configure("Status.TLabel", foreground=PURPLE, font=("Segoe UI", 10, "bold"))
+            s.configure("Hint.TLabel", foreground="gray")
+            self.btn_connect.configure(style="Red.TButton")
+            self.btn_disconnect.configure(style="Blue.TButton")
+            self.btn_rescan.configure(style="Green.TButton")
+            self.dev_list.configure(selectbackground=PURPLE, selectforeground="white")
+            self.root.title(f"{APP_NAME} {APP_VERSION} \U0001F308")
+            height = 8
+        else:
+            s.theme_use(self.default_theme)
+            s.configure("Status.TLabel", foreground="black", font=("Segoe UI", 10, "bold"))
+            s.configure("Hint.TLabel", foreground="gray")
+            for b in (self.btn_connect, self.btn_disconnect, self.btn_rescan):
+                b.configure(style="TButton")
+            self.dev_list.configure(selectbackground="#0078D7", selectforeground="white")
+            self.root.title(f"{APP_NAME} {APP_VERSION}")
+            height = 0
+        for c in (self.top_stripe, self.bottom_stripe):
+            c.configure(height=height)
+            self._draw_stripe(c)
+        if self.settings.get("rainbow") != on:
+            self.settings["rainbow"] = on
+            save_settings(self.settings)
 
     # logging
     def _setup_file_log(self):
@@ -528,20 +668,36 @@ class App:
         self.dev_list.delete(0, "end")
         for n in names:
             self.dev_list.insert("end", n)
-        if names:
-            idx = names.index(self.settings["last_device"]) if self.settings["last_device"] in names else 0
-            self.dev_list.selection_set(idx)
+        remembered = [n for n in self.settings.get("last_devices", []) if n in names]
+        homepods = [n for n in names if self.backend.devices.get(n) is not None
+                    and "HomePod" in (getattr(self.backend.devices[n].device_info, "model_str", "") or "")]
+        for n in remembered or homepods or names[:1]:
+            self.dev_list.selection_set(names.index(n))
 
     def on_connect(self):
-        sel = self.dev_list.curselection()
-        if not sel:
-            self.set_status("Pick a speaker first")
+        names = [self.dev_list.get(i) for i in self.dev_list.curselection()]
+        if not names:
+            self.set_status("Pick at least one speaker")
             return
-        name = self.dev_list.get(sel[0])
+        if self.split.get() and len(names) == 2:
+            channels = ["left", "right"]
+            if self.swap.get():
+                channels.reverse()
+        else:
+            if self.split.get():
+                self.log("Stereo pair needs exactly 2 speakers - playing full stereo on each")
+            channels = ["both"] * len(names)
         LATENCY_MS["value"] = self.lat.get()
-        self.settings.update(last_device=name, latency_ms=self.lat.get(), protocol=self.proto.get(), volume=self.vol.get())
+        self.settings.update(
+            last_devices=names,
+            latency_ms=self.lat.get(),
+            protocol=self.proto.get(),
+            volume=self.vol.get(),
+            stereo_split=self.split.get(),
+            swap_lr=self.swap.get(),
+        )
         save_settings(self.settings)
-        self.backend.submit(self.backend.connect(name, self.proto.get(), self.vol.get()))
+        self.backend.submit(self.backend.connect(names, channels, self.proto.get(), self.vol.get()))
 
     def on_disconnect(self):
         self.backend.submit(self.backend.disconnect())
@@ -564,7 +720,14 @@ class App:
         self.lat_lbl.config(text=str(v))
 
     def on_close(self):
-        self.settings.update(latency_ms=self.lat.get(), protocol=self.proto.get(), volume=self.vol.get())
+        self.settings.update(
+            latency_ms=self.lat.get(),
+            protocol=self.proto.get(),
+            volume=self.vol.get(),
+            stereo_split=self.split.get(),
+            swap_lr=self.swap.get(),
+            rainbow=self.rainbow.get(),
+        )
         save_settings(self.settings)
         try:
             self.backend.submit(self.backend.disconnect(quiet=True)).result(timeout=3)

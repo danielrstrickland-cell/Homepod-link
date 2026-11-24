@@ -15,10 +15,13 @@ The first time it runs, allow it through the Windows Firewall on **Private netwo
 
 1. Make sure the PC and HomePod are on the same Wi-Fi, and Windows has that network set to **Private**.
 2. Open HomePod Link. It scans for speakers automatically.
-3. Pick the HomePod and hit **Connect**. Everything the PC plays now comes out of the HomePod.
+3. Tap one or more speakers (all HomePods are selected by default) and hit **Connect**. Everything the PC plays now comes out of them.
+   - **Stereo pair (left + right):** with exactly 2 speakers picked, one plays the left channel and the other the right. **Swap L/R** if they're backwards.
+   - Without it, each speaker plays full stereo.
 4. **Volume** controls the HomePod.
 5. **Delay** sets the buffer: lower means less lag, but go too low and sound cuts out. Start at 500 ms and work down. Changes apply on the next Connect.
-6. **Mode** is AirPlay 2 by default. Auto and AirPlay 1 are there for troubleshooting.
+6. **Rainbow theme** switches between the rainbow look and the plain Windows look. It's remembered between launches.
+7. **Mode** is AirPlay 2 by default. Auto and AirPlay 1 are there for troubleshooting.
 
 If it won't connect, hit **Copy log** and send the log.
 
