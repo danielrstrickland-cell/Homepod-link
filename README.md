@@ -30,6 +30,12 @@ If it won't connect, hit **Copy log** and send the log.
 
 The full debug log is saved at `%APPDATA%\HomePodLink\homepod_link.log`.
 
+## Sound tab
+
+- **Visualizer:** live spectrum of what's being sent.
+- **Equalizer:** 5, 10, 16 or 32 bands, adding zero delay. Presets: Flat, Bass boost, Vocal, Loudness, Night and **Sim racing** (engine and kerb rumble up, boxy low-mids down, tyre scrub and spotter calls up). Drag a band to adjust it, double-click to reset it.
+- **Smart EQ:** a small analyser that runs on the PC, listens to the music, identifies its balance (bass-heavy, bright, vocal-forward, speech, balanced) and gently steers the EQ toward a balanced sound. Nothing leaves the PC.
+
 ## Self-correcting
 
 With **Auto-fix choppy sound** on (default):

@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.9.0"
+APP_VERSION = "1.0.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -52,6 +52,11 @@ DEFAULTS = {
     "rainbow": True,
     "auto_fix": True,
     "send_reports": True,
+    "eq_on": False,
+    "smart_eq": False,
+    "eq_bands": 10,
+    "eq_preset": "Flat",
+    "eq_gains": None,
     "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
     "settings_rev": 2,
 }
@@ -367,7 +372,8 @@ class LoopbackCapture(threading.Thread):
         self._stop_evt.set()
 
     def _fan_out(self, data):
-        TIMELINE.push(data.astype(np.float32), time.monotonic())
+        t = time.monotonic()
+        TIMELINE.push(EQ.process(data.astype(np.float32)), t)
 
     def run(self):
         try:
@@ -431,6 +437,172 @@ def find_line1(sources):
         if "line 1" in lab.lower():
             return lab
     return ""
+
+
+# -------------------------------------------------------------- equalizer --
+
+# Presets are curves over frequency (Hz -> dB), so they fit any band count.
+PRESETS = {
+    "Flat": [(20, 0), (20000, 0)],
+    "Bass boost": [(20, 6), (60, 6), (150, 3), (300, 0), (20000, 0)],
+    "Vocal": [(20, -2), (150, -2), (400, 0), (1200, 3), (3000, 3), (6000, 1), (20000, 0)],
+    "Loudness": [(20, 5), (100, 4), (400, 0), (3000, 0), (8000, 3), (20000, 3)],
+    "Night": [(20, -4), (100, -3), (300, 0), (2500, 2), (8000, 0), (20000, -2)],
+    # Engine and kerb rumble up, boxy low-mids down, tyre scrub and spotter calls up.
+    "Sim racing": [(20, 3), (45, 5), (90, 5), (180, 1), (300, -2), (500, -1),
+                   (1500, 2), (2500, 3), (5500, 2), (10000, 0), (20000, -1)],
+}
+BAND_CHOICES = (5, 10, 16, 32)
+
+
+def curve_db(points, f):
+    xs = np.log10([p[0] for p in points])
+    return float(np.interp(np.log10(f), xs, [p[1] for p in points]))
+
+
+def band_freqs(n):
+    return np.geomspace(31.5, 16000, n)
+
+
+def peaking_sos(freqs, gains_db, q):
+    """RBJ peaking biquads as an SOS array (one section per band)."""
+    sos = []
+    for f, g in zip(freqs, gains_db):
+        a = 10 ** (g / 40)
+        w = 2 * np.pi * f / SAMPLE_RATE
+        alpha = np.sin(w) / (2 * q)
+        b0, b1, b2 = 1 + alpha * a, -2 * np.cos(w), 1 - alpha * a
+        a0, a1, a2 = 1 + alpha / a, -2 * np.cos(w), 1 - alpha / a
+        sos.append([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+    return np.array(sos)
+
+
+class Equalizer:
+    """Graphic EQ (5-32 bands) applied in the capture path with zero added delay,
+    plus Smart EQ: a small on-device analyser that listens to the music, works out
+    its tonal balance (bass-heavy, bright, vocal, speech...) and steers the EQ
+    toward a balanced sound. Nothing leaves the PC."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.enabled = False
+        self.smart = False
+        self.n = 10
+        self.manual = np.zeros(self.n)
+        self.auto = np.zeros(self.n)
+        self.style = ""
+        self._an_buf = []
+        self._an_frames = 0
+        self._avg = None
+        self._last_smart = 0.0
+        self._rebuild()
+
+    @property
+    def gains(self):
+        return self.auto if self.smart else self.manual
+
+    def _rebuild(self, keep_state=False):
+        freqs = band_freqs(self.n)
+        bw = np.log2(16000 / 31.5) / max(1, self.n - 1)  # octaves between bands
+        q = np.sqrt(2 ** bw) / (2 ** bw - 1)
+        sos = peaking_sos(freqs, self.gains, q)
+        pre = 10 ** (-0.5 * max(0.0, float(np.max(self.gains))) / 20)  # some headroom; peaks soft-limited
+        with self.lock:
+            if not keep_state or getattr(self, "zi", None) is None or self.zi.shape[1] != len(sos):
+                from scipy.signal import sosfilt_zi
+
+                z = sosfilt_zi(sos) * 0
+                self.zi = np.stack([z, z])  # (channel, section, 2)
+            self.sos, self.pre, self.freqs = sos, pre, freqs
+
+    def set_bands(self, n):
+        old_f, old_g = band_freqs(self.n), self.manual
+        self.n = n
+        new_f = band_freqs(n)
+        self.manual = np.interp(np.log10(new_f), np.log10(old_f), old_g)
+        self.auto = np.zeros(n)
+        self._avg = None
+        self._rebuild()
+
+    def set_manual(self, gains):
+        self.manual = np.clip(np.asarray(gains, dtype=float), -12, 12)
+        self._rebuild(keep_state=True)
+
+    def apply_preset(self, name):
+        pts = PRESETS[name]
+        self.set_manual([curve_db(pts, f) for f in band_freqs(self.n)])
+
+    def process(self, data):
+        """data: (frames, 2) float32. Returns equalised audio; updates Smart EQ."""
+        if self.smart:
+            self._analyse(data)
+        if not self.enabled:
+            return data
+        from scipy.signal import sosfilt
+
+        with self.lock:
+            sos, pre = self.sos, self.pre
+            out = np.empty_like(data)
+            for ch in range(2):
+                out[:, ch], self.zi[ch] = sosfilt(sos, data[:, ch] * pre, zi=self.zi[ch])
+        # soft limiter: transparent below 0.8, rounds off peaks instead of hard clipping
+        over = np.abs(out) > 0.8
+        if over.any():
+            out[over] = np.sign(out[over]) * (0.8 + 0.2 * np.tanh((np.abs(out[over]) - 0.8) / 0.2))
+        return out
+
+    # ---- Smart EQ -------------------------------------------------------
+    def _analyse(self, data):
+        self._an_buf.append(data[:, 0] + data[:, 1])
+        self._an_frames += len(data)
+        if self._an_frames < 4096:
+            return
+        x = np.concatenate(self._an_buf)[-4096:]
+        self._an_buf, self._an_frames = [], 0
+        if np.sqrt(np.mean(x ** 2)) < 0.003:  # silence: learn nothing
+            return
+        spec = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+        fr = np.fft.rfftfreq(len(x), 1 / SAMPLE_RATE)
+        f = band_freqs(self.n)
+        edges = np.sqrt(f[:-1] * f[1:])
+        edges = np.concatenate([[f[0] / 1.4], edges, [f[-1] * 1.4]])
+        bands = np.array([spec[(fr >= lo) & (fr < hi)].sum() + 1e-12 for lo, hi in zip(edges[:-1], edges[1:])])
+        db = 10 * np.log10(bands)
+        self._avg = db if self._avg is None or len(self._avg) != len(db) else 0.97 * self._avg + 0.03 * db
+        now = time.monotonic()
+        if now - self._last_smart < 2:
+            return
+        self._last_smart = now
+        # Target: gently tilted "pink" balance (a little more low end, like a good speaker tuning).
+        target = np.array([curve_db([(20, 3), (100, 2), (1000, 0), (8000, -1), (20000, -2)], fq) for fq in f])
+        dev = (self._avg - self._avg.mean()) - (target - target.mean())
+        corr = np.clip(-0.6 * dev, -6, 6)
+        corr -= corr.mean()  # shape only, don't change loudness
+        self.auto = np.clip(0.7 * self.auto + 0.3 * corr, -6, 6)
+        self.style = self._classify(fr, spec, dev, f)
+        self._rebuild(keep_state=True)
+
+    @staticmethod
+    def _classify(fr, spec, dev, f):
+        total = spec.sum() + 1e-12
+        voice = spec[(fr > 300) & (fr < 3400)].sum() / total
+        low = dev[f < 150].mean() if np.any(f < 150) else 0
+        high = dev[f > 5000].mean() if np.any(f > 5000) else 0
+        mid = dev[(f > 800) & (f < 4000)].mean() if np.any((f > 800) & (f < 4000)) else 0
+        if voice > 0.75 and low < -3:
+            return "Speech / podcast"
+        if low > 4:
+            return "Bass-heavy (hip-hop, EDM, engines)"
+        if high > 3:
+            return "Bright (pop, rock cymbals)"
+        if mid > 3:
+            return "Vocal-forward"
+        if low < -4 and high < -2:
+            return "Thin / mid-range"
+        return "Balanced"
+
+
+EQ = Equalizer()
 
 
 # ------------------------------------------------------------------ backend --
@@ -1034,6 +1206,16 @@ class App:
         self.send_reports = tk.BooleanVar(value=self.settings.get("send_reports", True))
         self.proto = tk.StringVar(value="AirPlay 2")
         self.show_log = tk.BooleanVar(value=False)
+        self.page = "main"
+        self.eq_on = tk.BooleanVar(value=self.settings.get("eq_on", False))
+        self.smart_eq = tk.BooleanVar(value=self.settings.get("smart_eq", False))
+        EQ.set_bands(int(self.settings.get("eq_bands", 10)))
+        if self.settings.get("eq_gains") and len(self.settings["eq_gains"]) == EQ.n:
+            EQ.set_manual(self.settings["eq_gains"])
+        elif self.settings.get("eq_preset") in PRESETS:
+            EQ.apply_preset(self.settings["eq_preset"])
+        EQ.enabled, EQ.smart = self.eq_on.get(), self.smart_eq.get()
+        self._eq_save_job = None
         self.status = tk.StringVar(value="Looking for speakers...")
         self.state = "idle"  # idle | connecting | playing
         self.names = []
@@ -1072,6 +1254,7 @@ class App:
         """(Re)build the whole window. Called again when the theme changes."""
         if self.body is not None:
             self.body.destroy()
+        self.log_box = None
         rb = self.rainbow.get()
         th = self.th = THEMES["rainbow" if rb else "plain"]
         self.root.configure(bg=th["bg"])
@@ -1105,6 +1288,19 @@ class App:
         tk.Label(srow, textvariable=self.status, bg=th["bg"], fg=th["sub"], font=(FONT, 10),
                  anchor="w", justify="left", wraplength=360).pack(side="left", fill="x")
         self._update_dot()
+
+        # segmented control: Speakers | Sound
+        seg = tk.Frame(wrap, bg=th["off"])
+        seg.pack(fill="x", pady=(0, 12))
+        for key, text in (("main", "Speakers"), ("sound", "Sound")):
+            sel = self.page == key
+            b = tk.Label(seg, text=text, bg=th["card"] if sel else th["off"], fg=th["text"],
+                         font=(FONT, 10, "bold" if sel else "normal"), pady=5, cursor="hand2")
+            b.pack(side="left", fill="x", expand=True, padx=2, pady=2)
+            b.bind("<Button-1>", lambda e, k=key: self._go(k))
+        if self.page == "sound":
+            self._build_sound(wrap, th, lbl, rb)
+            return
 
         # speakers
         lbl(wrap, "SPEAKERS", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
@@ -1193,6 +1389,211 @@ class App:
         else:
             self.log_box = None
 
+    def _go(self, page):
+        self.page = page
+        self.build()
+
+    def _build_sound(self, wrap, th, lbl, rb):
+        # visualizer
+        lbl(wrap, "VISUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
+        vc = Card(wrap, th)
+        vc.pack(fill="x", pady=(0, 14))
+        self.viz = tk.Canvas(vc.inner, height=90, bg=th["card"], highlightthickness=0)
+        self.viz.pack(fill="x", padx=12, pady=8)
+        self._viz_levels = np.zeros(32)
+        self._viz_tick()
+
+        # equalizer
+        lbl(wrap, "EQUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
+        ec = Card(wrap, th)
+        ec.pack(fill="both", expand=True)
+        for i, (text, var, cmd) in enumerate((("Equalizer", self.eq_on, self._eq_toggle),
+                                              ("Smart EQ (learns the music)", self.smart_eq, self._eq_toggle))):
+            r = tk.Frame(ec.inner, bg=th["card"])
+            r.pack(fill="x", padx=12, pady=5)
+            lbl(r, text, 11).pack(side="left")
+            Toggle(r, var, th, command=cmd).pack(side="right")
+        self.style_lbl = lbl(ec.inner, "", 9, "sub")
+        self.style_lbl.pack(anchor="w", padx=12)
+        tk.Frame(ec.inner, bg=th["sep"], height=1).pack(fill="x", padx=12, pady=6)
+
+        # band count
+        brow = tk.Frame(ec.inner, bg=th["card"])
+        brow.pack(fill="x", padx=12, pady=(0, 6))
+        lbl(brow, "Bands", 10).pack(side="left")
+        for n in reversed(BAND_CHOICES):
+            sel = EQ.n == n
+            b = tk.Label(brow, text=str(n), bg=th["accent"] if sel else th["off"],
+                         fg="white" if sel else th["text"], font=(FONT, 9, "bold"), padx=9, pady=2, cursor="hand2")
+            b.pack(side="right", padx=2)
+            b.bind("<Button-1>", lambda e, n=n: self._eq_bands(n))
+
+        # presets
+        prow = tk.Frame(ec.inner, bg=th["card"])
+        prow.pack(fill="x", padx=10, pady=(0, 6))
+        cur = self.settings.get("eq_preset", "Flat")
+        for i, name in enumerate(PRESETS):
+            sel = name == cur and not self.smart_eq.get()
+            b = tk.Label(prow, text=name, bg=th["accent"] if sel else th["off"],
+                         fg="white" if sel else th["text"], font=(FONT, 9), padx=8, pady=3, cursor="hand2")
+            b.grid(row=i // 3, column=i % 3, padx=2, pady=2, sticky="ew")
+            b.bind("<Button-1>", lambda e, n=name: self._eq_preset(n))
+        for c in range(3):
+            prow.columnconfigure(c, weight=1)
+
+        # band sliders (vertical, drawn on one canvas so 32 bands still fit)
+        self.eqc = tk.Canvas(ec.inner, height=170, bg=th["card"], highlightthickness=0, cursor="hand2")
+        self.eqc.pack(fill="x", padx=8, pady=(4, 10))
+        self.eqc.bind("<Configure>", lambda e: self._eq_draw())
+        self.eqc.bind("<Button-1>", self._eq_drag)
+        self.eqc.bind("<B1-Motion>", self._eq_drag)
+        self.eqc.bind("<Double-Button-1>", self._eq_reset_band)
+        self._eq_refresh()
+
+    def _eq_geom(self):
+        w = self.eqc.winfo_width()
+        n = EQ.n
+        left, right, top, bot = 26, 6, 8, 140
+        step = (w - left - right) / n
+        return left, step, top, bot
+
+    def _eq_draw(self):
+        cv, th = self.eqc, self.th
+        cv.delete("all")
+        left, step, top, bot = self._eq_geom()
+        mid = (top + bot) / 2
+        for db in (12, 0, -12):
+            y = mid - db / 12 * (bot - top) / 2
+            cv.create_line(left, y, left + step * EQ.n, y, fill=th["sep"])
+            cv.create_text(left - 4, y, text=f"{db:+d}" if db else "0", anchor="e", fill=th["sub"], font=(FONT, 7))
+        gains = EQ.gains
+        live = self.eq_on.get()
+        for i, (f, g) in enumerate(zip(EQ.freqs, gains)):
+            x = left + step * (i + 0.5)
+            y = mid - g / 12 * (bot - top) / 2
+            col = (RAINBOW[i * len(RAINBOW) // EQ.n] if self.rainbow.get() else th["accent"]) if live else th["muted"]
+            cv.create_line(x, mid, x, y, fill=col, width=max(2, min(6, step * 0.35)))
+            r = max(4, min(8, step * 0.32))
+            cv.create_oval(x - r, y - r, x + r, y + r, fill="white", outline=th["knob_border"])
+            every = max(1, EQ.n // 8)
+            if i % every == 0:
+                lab = f"{f / 1000:.0f}k" if f >= 1000 else f"{f:.0f}"
+                cv.create_text(x, bot + 14, text=lab, fill=th["sub"], font=(FONT, 7))
+
+    def _eq_drag(self, e):
+        left, step, top, bot = self._eq_geom()
+        i = int((e.x - left) // step)
+        if not 0 <= i < EQ.n:
+            return
+        g = (((top + bot) / 2) - e.y) / ((bot - top) / 2) * 12
+        g = round(max(-12, min(12, g)) * 2) / 2
+        if self.smart_eq.get():  # touching a slider takes manual control
+            EQ.manual = EQ.auto.copy()
+            self.smart_eq.set(False)
+            EQ.smart = False
+            self.settings["smart_eq"] = False
+        gains = EQ.manual.copy()
+        gains[i] = g
+        EQ.set_manual(gains)
+        self.settings["eq_preset"] = "Custom"
+        self._eq_draw()
+        self._eq_save_later()
+
+    def _eq_reset_band(self, e):
+        left, step, top, bot = self._eq_geom()
+        i = int((e.x - left) // step)
+        if 0 <= i < EQ.n and not self.smart_eq.get():
+            gains = EQ.manual.copy()
+            gains[i] = 0
+            EQ.set_manual(gains)
+            self._eq_draw()
+            self._eq_save_later()
+
+    def _eq_save_later(self):
+        if self._eq_save_job:
+            self.root.after_cancel(self._eq_save_job)
+
+        def save():
+            self.settings.update(eq_gains=[float(g) for g in EQ.manual], eq_bands=EQ.n,
+                                 eq_on=self.eq_on.get(), smart_eq=self.smart_eq.get())
+            save_settings(self.settings)
+
+        self._eq_save_job = self.root.after(500, save)
+
+    def _eq_toggle(self):
+        EQ.enabled = self.eq_on.get()
+        EQ.smart = self.smart_eq.get()
+        if EQ.smart and not EQ.enabled:  # Smart EQ needs the EQ on
+            self.eq_on.set(True)
+            EQ.enabled = True
+        EQ._rebuild(keep_state=True)
+        self._eq_save_later()
+        self.build()
+
+    def _eq_bands(self, n):
+        EQ.set_bands(n)
+        if self.settings.get("eq_preset") in PRESETS:
+            EQ.apply_preset(self.settings["eq_preset"])
+        self._eq_save_later()
+        self.build()
+
+    def _eq_preset(self, name):
+        EQ.apply_preset(name)
+        EQ.smart = False
+        self.smart_eq.set(False)
+        if not self.eq_on.get():
+            self.eq_on.set(True)
+            EQ.enabled = True
+        self.settings["eq_preset"] = name
+        self._eq_save_later()
+        self.build()
+
+    def _eq_refresh(self):
+        """Keep the sliders and style label live while Smart EQ is steering."""
+        if self.page != "sound":
+            return
+        try:
+            if self.smart_eq.get():
+                self._eq_draw()
+                self.style_lbl.config(text=f"Sounds like: {EQ.style}" if EQ.style else "Listening...")
+            else:
+                self.style_lbl.config(text="")
+        except tk.TclError:
+            return
+        self.root.after(1000, self._eq_refresh)
+
+    def _viz_tick(self):
+        if self.page != "sound":
+            return
+        try:
+            cv = self.viz
+            w, h = cv.winfo_width(), 90
+        except tk.TclError:
+            return
+        n = 2048
+        with TIMELINE.lock:
+            wp = TIMELINE.write_pos
+            if wp is not None:
+                a = (wp - n) % TIMELINE.size
+                x = np.take(TIMELINE.ring[:, 0] + TIMELINE.ring[:, 1], range(a, a + n), mode="wrap")
+            else:
+                x = np.zeros(n)
+        spec = np.abs(np.fft.rfft(x * np.hanning(n)))
+        fr = np.fft.rfftfreq(n, 1 / SAMPLE_RATE)
+        edges = np.geomspace(40, 16000, 33)
+        lv = np.array([spec[(fr >= lo) & (fr < hi)].mean() if np.any((fr >= lo) & (fr < hi))
+                       else np.interp(np.sqrt(lo * hi), fr, spec)  # bass bands narrower than an FFT bin
+                       for lo, hi in zip(edges[:-1], edges[1:])])
+        lv = np.clip((20 * np.log10(lv + 1e-9) + 10) / 50, 0, 1)
+        self._viz_levels = np.maximum(lv, self._viz_levels * 0.85)  # fast attack, smooth fall
+        cv.delete("all")
+        bw = w / 32
+        for i, v in enumerate(self._viz_levels):
+            col = RAINBOW[i * len(RAINBOW) // 32] if self.rainbow.get() else self.th["accent"]
+            bh = max(3, v * (h - 6))
+            _round_rect(cv, i * bw + 2, h - bh, (i + 1) * bw - 2, h, 2, fill=col, outline="")
+        self.root.after(33, self._viz_tick)
+
     def _stripe(self, cv):
         cv.delete("all")
         w = cv.winfo_width()
@@ -1222,6 +1623,8 @@ class App:
         return {}
 
     def _render_speakers(self):
+        if self.page != "main":
+            return
         inner = self.spk_card.inner
         th = self.th
         for w in inner.winfo_children():
@@ -1508,6 +1911,10 @@ class App:
             rainbow=self.rainbow.get(),
             auto_fix=self.auto_fix.get(),
             send_reports=self.send_reports.get(),
+            eq_on=self.eq_on.get(),
+            smart_eq=self.smart_eq.get(),
+            eq_bands=EQ.n,
+            eq_gains=[float(g) for g in EQ.manual],
             last_devices=[n for n in self.names if n in self.selected] or self.settings.get("last_devices", []),
         )
         save_settings(self.settings)
