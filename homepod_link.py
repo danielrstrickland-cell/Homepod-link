@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -58,7 +58,8 @@ DEFAULTS = {
     "eq_preset": "Flat",
     "eq_gains": None,
     "auto_sim": True,
-    "viz_size": "M",
+    "resume_after_update": False,
+    "viz_height": 110,
     "viz_style": "Bars",
     "viz_colors": "Theme",
     "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
@@ -957,7 +958,7 @@ def fetch_latest_release():
     return num, url, rel.get("name") or tag
 
 
-def download_and_restart(url, log):
+def download_and_restart(url, log, progress=None):
     """Download the new exe next to this one, then swap it in and relaunch."""
     import subprocess
     import tempfile
@@ -969,11 +970,16 @@ def download_and_restart(url, log):
     new_path = exe + ".new"
     req = urllib.request.Request(url, headers={"User-Agent": "HomePodLink"})
     with urllib.request.urlopen(req, timeout=120) as r, open(new_path, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
         while True:
             chunk = r.read(1 << 16)
             if not chunk:
                 break
             f.write(chunk)
+            done += len(chunk)
+            if progress and total:
+                progress(done * 100 // total)
     if os.path.getsize(new_path) < 1_000_000:
         os.remove(new_path)
         raise RuntimeError("Download looks incomplete")
@@ -1115,7 +1121,6 @@ class Reporter:
 # ----------------------------------------------------------------------- UI --
 
 RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
-VIZ_SIZES = {"S": 60, "M": 110, "L": 180, "XL": 260}
 VIZ_STYLES = ("Bars", "Mirror", "Wave", "Dots", "Scope")
 VIZ_PALETTES = {
     "Theme": None,  # accent colour, or rainbow in the rainbow theme
@@ -1333,6 +1338,7 @@ class App:
         self.root.after(3000, self._sim_watch)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.on_scan()
+        self.root.after(4000, lambda: self.on_update(quiet=True))
 
     # ------------------------------------------------------------- layout --
     def build(self):
@@ -1447,7 +1453,8 @@ class App:
         # link row
         links = tk.Frame(wrap, bg=th["bg"])
         links.pack(pady=(0, 6))
-        for text, cmd in (("Rescan", self.on_scan), ("Update", self.on_update),
+        upd = f"Update to {self._update_available}" if getattr(self, "_update_available", None) else "Update"
+        for text, cmd in (("Rescan", self.on_scan), (upd, self.on_update),
                           ("GitHub", self.open_repo), ("Copy log", self.copy_log),
                           ("Report", self.report_now)):
             l = tk.Label(links, text=text, bg=th["bg"], fg=th["accent"], font=(FONT, 10), cursor="hand2")
@@ -1483,9 +1490,18 @@ class App:
         lbl(wrap, "VISUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
         vc = Card(wrap, th)
         vc.pack(fill="x", pady=(0, 14))
-        self.viz_h = VIZ_SIZES.get(self.settings.get("viz_size", "M"), 110)
+        self.viz_h = int(self.settings.get("viz_height", 110))
         self.viz = tk.Canvas(vc.inner, height=self.viz_h, bg=th["card"], highlightthickness=0, cursor="hand2")
-        self.viz.pack(fill="x", padx=12, pady=(8, 4))
+        self.viz.pack(fill="x", padx=12, pady=(8, 0))
+        # drag handle: pull down/up to resize the visualizer
+        grip = tk.Canvas(vc.inner, height=14, bg=th["card"], highlightthickness=0, cursor="sb_v_double_arrow")
+        grip.pack(fill="x", padx=12, pady=(0, 4))
+        grip.bind("<Configure>", lambda e: (grip.delete("all"), _round_rect(
+            grip, e.width / 2 - 22, 5, e.width / 2 + 22, 10, 2, fill=th["knob_border"], outline="")))
+        grip.bind("<ButtonPress-1>", lambda e: setattr(self, "_viz_drag", (e.y_root, self.viz_h)))
+        grip.bind("<B1-Motion>", self._viz_resize)
+        grip.bind("<ButtonRelease-1>", lambda e: (self.settings.__setitem__("viz_height", self.viz_h),
+                                                  save_settings(self.settings), vc._redraw()))
         self.viz.bind("<Button-1>", lambda e: self._viz_set("viz_style", VIZ_STYLES[
             (VIZ_STYLES.index(self.settings.get("viz_style", "Bars")) + 1) % len(VIZ_STYLES)]))
         self._viz_levels = np.zeros(32)
@@ -1503,7 +1519,6 @@ class App:
 
         chips(vc.inner, "viz_style", VIZ_STYLES, self.settings.get("viz_style", "Bars"))
         chips(vc.inner, "viz_colors", list(VIZ_PALETTES), self.settings.get("viz_colors", "Theme"))
-        chips(vc.inner, "viz_size", list(VIZ_SIZES), self.settings.get("viz_size", "M"))
         self._viz_tick()
 
         # equalizer
@@ -1749,6 +1764,11 @@ class App:
                 pts += [j / 1024 * w, h / 2 - seg[j] / peak * (h / 2 - 4)]
             cv.create_line(pts, fill=col(8), width=2, smooth=True)
         self.root.after(33, self._viz_tick)
+
+    def _viz_resize(self, e):
+        y0, h0 = getattr(self, "_viz_drag", (e.y_root, self.viz_h))
+        self.viz_h = int(max(40, min(400, h0 + (e.y_root - y0))))
+        self.viz.configure(height=self.viz_h)
 
     def _viz_set(self, key, value):
         self.settings[key] = value
@@ -2002,6 +2022,13 @@ class App:
 
         fut.add_done_callback(done)
 
+    def _maybe_resume(self):
+        if self.settings.get("resume_after_update"):
+            self.settings["resume_after_update"] = False
+            save_settings(self.settings)
+            self.log(f"Updated to build {BUILD_NUMBER} - resuming playback")
+            self.on_connect()
+
     def _fill_devices(self, names):
         def is_pod(n):
             return "HomePod" in (getattr(self.backend.devices[n].device_info, "model_str", "") or "")
@@ -2015,6 +2042,7 @@ class App:
             keep = {names[0]}
         self.selected = keep
         self._render_speakers()
+        self._maybe_resume()
 
     def on_play(self):
         if self.state in ("playing", "connecting"):
@@ -2077,24 +2105,44 @@ class App:
 
         webbrowser.open(f"https://github.com/{REPO}/releases/latest")
 
-    def on_update(self):
-        self.set_status("Checking for updates...")
+    def on_update(self, quiet=False):
+        if not quiet:
+            self.set_status("Checking for updates...")
 
         def work():
             try:
                 num, url, name = fetch_latest_release()
                 self.log(f"Latest release: {name} (this is build {BUILD_NUMBER})")
                 if num <= BUILD_NUMBER or not url:
-                    self.set_status(f"You're up to date (build {BUILD_NUMBER})")
+                    if not quiet:
+                        self.set_status(f"You're up to date (build {BUILD_NUMBER})")
                     return
-                self.set_status(f"Downloading build {num}...")
-                download_and_restart(url, self.log)
-                self.root.after(0, self.on_close)
+                if quiet:  # startup check: offer it, don't interrupt
+                    self.root.after(0, lambda: self._offer_update(num))
+                    return
+                last = [-1]
+
+                def prog(pct):
+                    if pct // 5 != last[0]:
+                        last[0] = pct // 5
+                        self.root.after(0, lambda: self.status.set(f"Downloading build {num}... {pct}%"))
+
+                download_and_restart(url, self.log, prog)
+                # Come back playing on the same speakers after the restart.
+                self.settings["resume_after_update"] = self.state in ("playing", "connecting")
+                self.root.after(0, lambda: self.status.set(f"Installing build {num} - back in a few seconds"))
+                self.root.after(600, self.on_close)
             except Exception as ex:
                 self.log(f"Update failed: {ex!r}")
-                self.set_status("Update failed - see log")
+                if not quiet:
+                    self.set_status("Update failed - see log")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _offer_update(self, num):
+        self._update_available = num
+        self.set_status(f"Build {num} is available - tap Update")
+        self.build()
 
     def on_close(self):
         pending = getattr(self, "_pending_delay", None)
