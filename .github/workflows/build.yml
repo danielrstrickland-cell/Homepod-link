@@ -22,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
       - name: Smoke test imports
-        run: python -c "import pyatv, soundcard, numpy, miniaudio, tkinter; print('imports ok')"
+        run: python -c "import pyatv, soundcard, numpy, miniaudio, tkinter; from pyatv.auth.hap_srp import SRPAuthHandler; h=SRPAuthHandler(); h.initialize(); h.step1(3939); print('imports + pairing step ok')"
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name HomePodLink

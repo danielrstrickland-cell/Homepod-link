@@ -1,3 +1,5 @@
 pyatv==0.18.0
+# srptools 2.0 changed its API and breaks pyatv's HomePod pairing - keep on 1.0.1
+srptools==1.0.1
 soundcard==0.4.6
 numpy

@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_SAMPLE = 2
@@ -231,6 +231,7 @@ class Backend:
         self.buf = LiveBuffer()
         self.connected_name = None
         self.want_connected = False
+        self.gen = 0  # bumps on every Connect/Disconnect so old retry loops quit
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -269,9 +270,11 @@ class Backend:
         if conf is None:
             self.on_status("Speaker not found - rescan")
             return
+        self.gen += 1
+        my_gen = self.gen
         self.want_connected = True
         attempt = 0
-        while self.want_connected:
+        while self.want_connected and my_gen == self.gen:
             attempt += 1
             try:
                 await self._stream_once(conf, name, protocol_label, volume, attempt)
@@ -283,8 +286,8 @@ class Backend:
                 cause = ex.__cause__ or ex.__context__
                 if cause:
                     self.log(f"  caused by: {cause!r}")
-            if not self.want_connected:
-                break
+            if not self.want_connected or my_gen != self.gen:
+                return
             if attempt >= 5:
                 self.on_status("Couldn't stay connected - copy the log and send it")
                 self.want_connected = False
@@ -316,17 +319,29 @@ class Backend:
         except Exception as ex:
             self.log(f"Initial volume deferred: {ex!r}")
         self.connected_name = name
-        self.on_status(f"Connected - playing PC audio on {name}")
+        self.on_status(f"Pairing with {name}...")
         started = time.monotonic()
-        await self.atv.stream.stream_file(LIVE_SENTINEL)
+        my_gen = self.gen
+
+        async def confirm():
+            await asyncio.sleep(3)
+            if self.connected_name == name and my_gen == self.gen:
+                self.on_status(f"Playing PC audio on {name}")
+
+        confirm_task = asyncio.ensure_future(confirm())
+        try:
+            await self.atv.stream.stream_file(LIVE_SENTINEL)
+        finally:
+            confirm_task.cancel()
         self.log(
             f"Stream ended after {time.monotonic() - started:.1f} s "
             f"(underruns={self.buf.underruns}, dropped frames={self.buf.dropped})"
         )
-        self.connected_name = None
-        if self.atv:
-            self.atv.close()
-            self.atv = None
+        if my_gen == self.gen:
+            self.connected_name = None
+            if self.atv:
+                self.atv.close()
+                self.atv = None
 
     async def set_volume(self, volume):
         if self.atv and self.connected_name:
@@ -337,6 +352,7 @@ class Backend:
 
     async def disconnect(self, quiet=False):
         self.want_connected = False
+        self.gen += 1
         if self.atv:
             try:
                 await self.atv.remote_control.stop()
