@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_SAMPLE = 2
@@ -89,46 +89,115 @@ StreamContext.reset = _patched_reset
 # ------------------------------------------------------------- audio source --
 
 
+class Timeline:
+    """One shared, time-stamped ring of captured PC audio.
+
+    Every speaker reads the slice that matches the wall clock (minus a small
+    safety delay), so all speakers play the same moment at the same time no
+    matter when each one connected."""
+
+    SECONDS = 8
+    READ_DELAY = 0.08  # read audio captured ~80 ms ago, so it has surely arrived
+    RESYNC = 0.02  # snap a reader/writer back if it drifts more than 20 ms
+
+    def __init__(self):
+        self.size = SAMPLE_RATE * self.SECONDS
+        self.ring = np.zeros((self.size, CHANNELS), dtype=np.float32)
+        self.lock = threading.Lock()
+        self.t_ref = time.monotonic()
+        self.write_pos = None
+        self.writer_resyncs = 0
+
+    def now_pos(self, t=None):
+        return int(((t if t is not None else time.monotonic()) - self.t_ref) * SAMPLE_RATE)
+
+    def _zero(self, start, end):
+        if end <= start:
+            return
+        if end - start >= self.size:
+            self.ring[:] = 0
+            return
+        a, b = start % self.size, end % self.size
+        if a < b:
+            self.ring[a:b] = 0
+        else:
+            self.ring[a:] = 0
+            self.ring[:b] = 0
+
+    def push(self, data, t_recv):
+        n = len(data)
+        expected = self.now_pos(t_recv) - n
+        with self.lock:
+            if self.write_pos is None or abs(self.write_pos - expected) > self.RESYNC * SAMPLE_RATE:
+                if self.write_pos is not None and expected > self.write_pos:
+                    self._zero(self.write_pos, expected)  # silence gap
+                if self.write_pos is not None:
+                    self.writer_resyncs += 1
+                self.write_pos = expected
+            a = self.write_pos % self.size
+            first = min(n, self.size - a)
+            self.ring[a:a + first] = data[:first]
+            if first < n:
+                self.ring[: n - first] = data[first:]
+            self.write_pos += n
+
+    def read(self, pos, n):
+        """Return n frames starting at pos (zeros where nothing was captured)."""
+        out = np.zeros((n, CHANNELS), dtype=np.float32)
+        with self.lock:
+            wp = self.write_pos
+            if wp is None:
+                return out, 0
+            oldest = wp - self.size + SAMPLE_RATE  # keep a 1 s guard from the writer
+            lo, hi = max(pos, oldest), min(pos + n, wp)
+            if hi <= lo:
+                return out, 0
+            a, b = lo % self.size, hi % self.size
+            if a < b:
+                out[lo - pos:hi - pos] = self.ring[a:b]
+            else:
+                k = self.size - a
+                out[lo - pos:lo - pos + k] = self.ring[a:]
+                out[lo - pos + k:hi - pos] = self.ring[:b]
+            return out, hi - lo
+
+
+TIMELINE = Timeline()
+
+
 class LiveBuffer:
-    """Thread-safe PCM buffer between the capture thread and the sender."""
+    """Per-speaker reader on the shared timeline (keeps the old name/interface)."""
 
-    def __init__(self, max_ms=200, channel="both"):
+    def __init__(self, channel="both"):
         self.channel = channel  # "both", "left" or "right"
-        self._lock = threading.Lock()
-        self._buf = bytearray()
-        self.max_bytes = int(SAMPLE_RATE * max_ms / 1000) * FRAME_BYTES
-        self.dropped = 0
-        self.underruns = 0
-        self.captured = 0
-
-    def push(self, data: bytes):
-        with self._lock:
-            self.captured += len(data) // FRAME_BYTES
-            self._buf.extend(data)
-            # Keep latency bounded: if capture runs ahead (clock drift), drop oldest.
-            extra = len(self._buf) - self.max_bytes
-            if extra > 0:
-                extra -= extra % FRAME_BYTES
-                del self._buf[:extra]
-                self.dropped += extra // FRAME_BYTES
-
-    def pop(self, nbytes: int) -> bytes:
-        with self._lock:
-            if len(self._buf) >= nbytes:
-                out = bytes(self._buf[:nbytes])
-                del self._buf[:nbytes]
-                return out
-            # Not enough audio (silence on the PC or capture hiccup): send what we
-            # have padded with silence so the stream never stops.
-            out = bytes(self._buf) + b"\x00" * (nbytes - len(self._buf))
-            if self._buf:
-                self.underruns += 1
-            self._buf.clear()
-            return out
+        self.pos = None
+        self.dropped = 0  # resyncs (times we jumped to stay in time)
+        self.underruns = 0  # reads where audio hadn't arrived yet
+        self.captured = 0  # frames of real audio sent
 
     def clear(self):
-        with self._lock:
-            self._buf.clear()
+        self.pos = None
+
+    def pop(self, nbytes: int) -> bytes:
+        n = nbytes // FRAME_BYTES
+        target = TIMELINE.now_pos() - int(Timeline.READ_DELAY * SAMPLE_RATE)
+        if self.pos is None or abs(self.pos - target) > Timeline.RESYNC * SAMPLE_RATE:
+            if self.pos is not None:
+                self.dropped += 1
+            self.pos = target
+        data, got = TIMELINE.read(self.pos, n)
+        self.pos += n
+        if got == 0:
+            pass  # PC is silent - send silence
+        elif got < n:
+            self.underruns += 1
+        self.captured += got
+        if self.channel == "left":
+            data = np.column_stack([data[:, 0], data[:, 0]])
+        elif self.channel == "right":
+            data = np.column_stack([data[:, 1], data[:, 1]])
+        # AirPlay wants big-endian 16-bit PCM
+        return (np.clip(data, -1.0, 1.0) * 32767).astype(">i2").tobytes()
 
 
 class LiveSource(AudioSource):
@@ -201,22 +270,7 @@ class LoopbackCapture(threading.Thread):
         self._stop_evt.set()
 
     def _fan_out(self, data):
-        with self._lock:
-            bufs = list(self.buffers)
-        if not bufs:
-            return
-        cache = {}
-        for buf in bufs:
-            if buf.channel not in cache:
-                if buf.channel == "left":
-                    d = np.column_stack([data[:, 0], data[:, 0]])
-                elif buf.channel == "right":
-                    d = np.column_stack([data[:, 1], data[:, 1]])
-                else:
-                    d = data
-                # AirPlay wants big-endian 16-bit PCM
-                cache[buf.channel] = (np.clip(d, -1.0, 1.0) * 32767).astype(">i2").tobytes()
-            buf.push(cache[buf.channel])
+        TIMELINE.push(data.astype(np.float32), time.monotonic())
 
     def run(self):
         try:
@@ -407,8 +461,9 @@ class Backend:
         secs = max(0.1, time.monotonic() - started)
         self.log(
             f"{sess.name}: stream ended after {secs:.1f} s "
-            f"(underruns={sess.buf.underruns}, dropped frames={sess.buf.dropped}, "
-            f"capture rate={sess.buf.captured / secs:.0f} Hz)"
+            f"(late reads={sess.buf.underruns}, resyncs={sess.buf.dropped}, "
+            f"capture writer resyncs={TIMELINE.writer_resyncs}, "
+            f"audio rate={sess.buf.captured / secs:.0f} Hz)"
         )
         if my_gen == self.gen:
             self._close_atv(sess)
