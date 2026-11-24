@@ -29,6 +29,13 @@ If it won't connect, hit **Copy log** and send the log.
 
 The full debug log is saved at `%APPDATA%\HomePodLink\homepod_link.log`.
 
+## Self-correcting
+
+With **Auto-fix choppy sound** on (default):
+- If a HomePod reports lost audio for 20 seconds, the app raises the delay by 250 ms and reconnects.
+- If PC audio arrives late, it reads a little further back with no interruption.
+- If a speaker drops, it keeps reconnecting on its own.
+
 ## HomePod settings that matter
 
 In the Home app: **Home Settings → Speakers & TV → Allow Speaker & TV Access** set to **Everyone** or **Anyone On the Same Network**, and **Require Password** off.

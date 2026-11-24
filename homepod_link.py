@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.5.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 SAMPLE_RATE = 44100
@@ -49,6 +49,7 @@ DEFAULTS = {
     "stereo_split": False,
     "swap_lr": False,
     "rainbow": True,
+    "auto_fix": True,
 }
 
 # ---------------------------------------------------------------- settings --
@@ -99,8 +100,10 @@ class Timeline:
     matter when each one connected."""
 
     SECONDS = 8
-    READ_DELAY = 0.08  # read audio captured ~80 ms ago, so it has surely arrived
-    RESYNC = 0.02  # snap a reader/writer back if it drifts more than 20 ms
+    READ_DELAY = 0.12  # read audio captured ~120 ms ago, so it has surely arrived
+    SNAP = 0.25  # only jump if more than 250 ms off (after silence, hiccups)
+    NUDGE = 2  # otherwise correct gently: at most 2 samples per block (inaudible)
+    DEADBAND = 0.012  # ignore normal jitter under 12 ms
 
     def __init__(self):
         self.size = SAMPLE_RATE * self.SECONDS
@@ -130,12 +133,22 @@ class Timeline:
         n = len(data)
         expected = self.now_pos(t_recv) - n
         with self.lock:
-            if self.write_pos is None or abs(self.write_pos - expected) > self.RESYNC * SAMPLE_RATE:
+            if self.write_pos is None or abs(self.write_pos - expected) > self.SNAP * SAMPLE_RATE:
                 if self.write_pos is not None and expected > self.write_pos:
                     self._zero(self.write_pos, expected)  # silence gap
                 if self.write_pos is not None:
                     self.writer_resyncs += 1
                 self.write_pos = expected
+            else:
+                # Track the clock slowly so capture jitter never causes a jump.
+                self._err = 0.98 * getattr(self, "_err", 0.0) + 0.02 * (expected - self.write_pos)
+                step = 0
+                if abs(self._err) > self.DEADBAND * SAMPLE_RATE:
+                    step = int(max(-self.NUDGE, min(self.NUDGE, round(self._err))))
+                if step > 0:
+                    self._zero(self.write_pos, self.write_pos + step)
+                self.write_pos += step
+                self._err -= step
             a = self.write_pos % self.size
             first = min(n, self.size - a)
             self.ring[a:a + first] = data[:first]
@@ -183,10 +196,19 @@ class LiveBuffer:
     def pop(self, nbytes: int) -> bytes:
         n = nbytes // FRAME_BYTES
         target = TIMELINE.now_pos() - int(Timeline.READ_DELAY * SAMPLE_RATE)
-        if self.pos is None or abs(self.pos - target) > Timeline.RESYNC * SAMPLE_RATE:
+        if self.pos is None or abs(self.pos - target) > Timeline.SNAP * SAMPLE_RATE:
             if self.pos is not None:
                 self.dropped += 1
             self.pos = target
+            self._err = 0.0
+        else:
+            # Sender timing is bursty; follow the clock smoothly instead of jumping.
+            self._err = 0.95 * getattr(self, "_err", 0.0) + 0.05 * (target - self.pos)
+            step = 0
+            if abs(self._err) > Timeline.DEADBAND * SAMPLE_RATE:
+                step = int(max(-Timeline.NUDGE, min(Timeline.NUDGE, round(self._err))))
+            self.pos += step
+            self._err -= step
         data, got = TIMELINE.read(self.pos, n)
         self.pos += n
         if got == 0:
@@ -243,6 +265,20 @@ async def _patched_open_source(source, sample_rate, channels, sample_size):
 
 
 raop_mod.open_source = _patched_open_source
+
+# Count lost-audio reports from each speaker (they ask us to resend packets).
+from pyatv.protocols.raop import stream_client as _sc  # noqa: E402
+
+LOST = {}  # speaker IP -> lost packet count
+_orig_retx = _sc.ControlClient._retransmit_lost_packets
+
+
+def _counting_retx(self, request, addr):
+    LOST[addr[0]] = LOST.get(addr[0], 0) + request.lost_packets
+    return _orig_retx(self, request, addr)
+
+
+_sc.ControlClient._retransmit_lost_packets = _counting_retx
 
 # ------------------------------------------------------------------ capture --
 
@@ -333,6 +369,9 @@ class Backend:
         self.sessions = {}
         self.capture = None
         self.gen = 0  # bumps on every Connect/Disconnect so old loops quit
+        self.auto_fix = True
+        self.on_delay_change = None  # UI callback when auto-fix raises the delay
+        self._last_args = None
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -382,6 +421,8 @@ class Backend:
         await self.disconnect(quiet=True)
         self.gen += 1
         my_gen = self.gen
+        self._last_args = (names, channels, protocol_label, volume)
+        asyncio.ensure_future(self._health_monitor(my_gen))
         if self.capture is None or not self.capture.is_alive():
             self.capture = LoopbackCapture(self.log)
             self.capture.start()
@@ -417,11 +458,12 @@ class Backend:
                     self.capture.remove(sess.buf)
             if my_gen != self.gen:
                 return
-            if attempt >= 5:
+            if attempt >= 5 and not self.auto_fix:
                 self.on_status(f"{sess.name} couldn't stay connected - copy the log and send it")
                 break
-            self.on_status(f"{sess.name} dropped - reconnecting ({attempt}/5)...")
-            await asyncio.sleep(2)
+            wait = min(15, 2 * attempt)
+            self.on_status(f"{sess.name} dropped - reconnecting in {wait} s (try {attempt})...")
+            await asyncio.sleep(wait)
         if my_gen == self.gen:
             self._close_atv(sess)
 
@@ -469,6 +511,47 @@ class Backend:
         )
         if my_gen == self.gen:
             self._close_atv(sess)
+
+    async def _health_monitor(self, my_gen):
+        """Self-correction: watch for choppy audio and fix it automatically.
+
+        - Speakers reporting lost audio (network) -> raise the delay and reconnect.
+        - Our own reads arriving before the PC audio (capture hiccups) -> read a
+          little further back, live, with no reconnect.
+        """
+        await asyncio.sleep(10)  # let things settle after connecting
+        last_lost = dict(LOST)
+        last_late = {}
+        bad_windows = 0
+        while my_gen == self.gen:
+            await asyncio.sleep(10)
+            if my_gen != self.gen or not self.auto_fix:
+                last_lost = dict(LOST)
+                continue
+            worst = 0.0
+            for sess in list(self.sessions.values()):
+                ip = str(self.devices[sess.name].address) if sess.name in self.devices else ""
+                lost = LOST.get(ip, 0) - last_lost.get(ip, 0)
+                rate = lost / (10 * SAMPLE_RATE / 352)  # fraction of packets lost
+                worst = max(worst, rate)
+                if lost:
+                    self.log(f"Auto-fix: {sess.name} lost {lost} packets in 10 s ({rate:.1%})")
+                late = sess.buf.underruns - last_late.get(sess.name, 0)
+                last_late[sess.name] = sess.buf.underruns
+                if late > 3 and Timeline.READ_DELAY < 0.3:
+                    Timeline.READ_DELAY = round(Timeline.READ_DELAY + 0.03, 3)
+                    self.log(f"Auto-fix: PC audio arriving late - reading {Timeline.READ_DELAY * 1000:.0f} ms back")
+            last_lost = dict(LOST)
+            bad_windows = bad_windows + 1 if worst > 0.02 else 0
+            if bad_windows >= 2 and LATENCY_MS["value"] < 2000 and self._last_args:
+                new = min(2000, LATENCY_MS["value"] + 250)
+                self.log(f"Auto-fix: sound was choppy for 20 s - raising delay to {new} ms and reconnecting")
+                LATENCY_MS["value"] = new
+                if self.on_delay_change:
+                    self.on_delay_change(new)
+                self.on_status(f"Fixing choppy sound - delay raised to {new} ms")
+                asyncio.ensure_future(self.connect(*self._last_args))
+                return
 
     def _close_atv(self, sess):
         if sess.atv:
@@ -568,6 +651,147 @@ def download_and_restart(url, log):
 RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
 PURPLE = "#750787"
 
+THEMES = {
+    "plain": {
+        "bg": "#F2F2F7", "card": "#FFFFFF", "text": "#1C1C1E", "sub": "#6C6C70",
+        "sep": "#E5E5EA", "accent": "#007AFF", "accent_dn": "#0062CC", "on": "#34C759",
+        "off": "#E5E5EA", "muted": "#8E8E93", "knob_border": "#D1D1D6",
+    },
+    "rainbow": {
+        "bg": "#F7F2FA", "card": "#FFFFFF", "text": "#1C1C1E", "sub": "#6C6C70",
+        "sep": "#EEE5F2", "accent": PURPLE, "accent_dn": "#5A055F", "on": "#008026",
+        "off": "#E5E5EA", "muted": "#8E8E93", "knob_border": "#D1D1D6",
+    },
+}
+
+FONT = "Segoe UI Variable Text" if sys.platform == "win32" else "Segoe UI"
+FONT_DISPLAY = "Segoe UI Variable Display" if sys.platform == "win32" else "Segoe UI"
+
+
+def _round_rect(cv, x1, y1, x2, y2, r, **kw):
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+class Card(tk.Canvas):
+    """White rounded card; put widgets in .inner."""
+
+    def __init__(self, parent, th, radius=12):
+        super().__init__(parent, bg=th["bg"], highlightthickness=0, bd=0, height=10)
+        self.th, self.r = th, radius
+        self.inner = tk.Frame(self, bg=th["card"])
+        self._win = self.create_window(0, 0, window=self.inner, anchor="nw")
+        self.bind("<Configure>", self._redraw)
+        self.inner.bind("<Configure>", self._redraw)
+
+    def _redraw(self, _e=None):
+        w = self.winfo_width()
+        h = self.inner.winfo_reqheight() + 8
+        self.configure(height=h)
+        self.delete("bgshape")
+        _round_rect(self, 0, 0, w, h, self.r, fill=self.th["card"], outline="", tags="bgshape")
+        self.tag_lower("bgshape")
+        self.coords(self._win, 0, 4)
+        self.itemconfigure(self._win, width=w)
+
+
+class Toggle(tk.Canvas):
+    """iOS-style on/off switch bound to a BooleanVar."""
+
+    def __init__(self, parent, var, th, command=None):
+        super().__init__(parent, width=46, height=28, bg=th["card"], highlightthickness=0, bd=0, cursor="hand2")
+        self.var, self.th, self.command = var, th, command
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _click(self, _e):
+        self.var.set(not self.var.get())
+        self._draw()
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        on = self.var.get()
+        _round_rect(self, 1, 1, 45, 27, 13, fill=self.th["on"] if on else self.th["off"], outline="")
+        x = 31 if on else 15
+        self.create_oval(x - 11, 3, x + 11, 25, fill="white", outline=self.th["knob_border"])
+
+
+class Slider(tk.Canvas):
+    """Thin Apple-style slider with a big white knob."""
+
+    def __init__(self, parent, var, lo, hi, th, step=1, command=None, rainbow=False):
+        super().__init__(parent, height=30, bg=th["card"], highlightthickness=0, bd=0, cursor="hand2")
+        self.var, self.lo, self.hi, self.th = var, lo, hi, th
+        self.step, self.command, self.rainbow = step, command, rainbow
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._drag)
+        self.bind("<B1-Motion>", self._drag)
+
+    def _x(self, v):
+        w = self.winfo_width()
+        return 14 + (w - 28) * (v - self.lo) / (self.hi - self.lo)
+
+    def _drag(self, e):
+        w = self.winfo_width()
+        frac = min(1, max(0, (e.x - 14) / max(1, w - 28)))
+        v = self.lo + frac * (self.hi - self.lo)
+        v = int(round(v / self.step) * self.step)
+        if v != self.var.get():
+            self.var.set(v)
+            self._draw()
+            if self.command:
+                self.command(v)
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        x = self._x(self.var.get())
+        _round_rect(self, 14, 12, w - 14, 18, 3, fill=self.th["off"], outline="")
+        if self.rainbow:
+            seg = (x - 14) / len(RAINBOW)
+            for i, c in enumerate(RAINBOW):
+                self.create_rectangle(14 + i * seg, 12, 14 + (i + 1) * seg, 18, fill=c, outline=c)
+        else:
+            _round_rect(self, 14, 12, max(20, x), 18, 3, fill=self.th["accent"], outline="")
+        self.create_oval(x - 12, 3, x + 12, 27, fill="white", outline=self.th["knob_border"])
+
+
+class BigButton(tk.Canvas):
+    def __init__(self, parent, text, th, command, rainbow=False):
+        super().__init__(parent, height=46, bg=th["bg"], highlightthickness=0, bd=0, cursor="hand2")
+        self.text, self.th, self.command, self.rainbow = text, th, command, rainbow
+        self.pressed = False
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<ButtonPress-1>", lambda e: self._press(True))
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def set_text(self, text):
+        self.text = text
+        self._draw()
+
+    def _press(self, p):
+        self.pressed = p
+        self._draw()
+
+    def _release(self, e):
+        self._press(False)
+        if 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height():
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        fill = self.th["accent_dn"] if self.pressed else self.th["accent"]
+        _round_rect(self, 0, 0, w, 46, 12, fill=fill, outline="")
+        if self.rainbow:
+            seg = (w - 24) / len(RAINBOW)
+            for i, c in enumerate(RAINBOW):
+                self.create_rectangle(12 + i * seg, 40, 12 + (i + 1) * seg, 43, fill=c, outline=c)
+        self.create_text(w / 2, 22, text=self.text, fill="white", font=(FONT, 12, "bold"))
+
 
 class App:
     def __init__(self, root):
@@ -578,104 +802,28 @@ class App:
         self.log_lines = []
         self._setup_file_log()
 
-        self.style = ttk.Style(root)
-        self.default_theme = self.style.theme_use()
-
-        root.geometry("440x640")
-        root.minsize(400, 540)
-
-        self.top_stripe = tk.Canvas(root, height=0, highlightthickness=0, bd=0)
-        self.top_stripe.pack(fill="x")
-
-        pad = {"padx": 12, "pady": 4}
-        ttk.Label(root, text="Speakers on your network (tap one or more)").pack(anchor="w", **pad)
-        self.dev_list = tk.Listbox(
-            root, height=5, activestyle="none", exportselection=False, selectmode="multiple"
-        )
-        self.dev_list.pack(fill="x", padx=12)
-
-        srow = ttk.Frame(root)
-        srow.pack(fill="x", **pad)
+        self.vol = tk.IntVar(value=self.settings["volume"])
+        self.lat = tk.IntVar(value=self.settings["latency_ms"])
         self.split = tk.BooleanVar(value=self.settings["stereo_split"])
         self.swap = tk.BooleanVar(value=self.settings["swap_lr"])
-        ttk.Checkbutton(srow, text="Stereo pair (left + right)", variable=self.split).pack(side="left")
-        ttk.Checkbutton(srow, text="Swap L/R", variable=self.swap).pack(side="left", padx=(12, 0))
-
-        row = ttk.Frame(root)
-        row.pack(fill="x", **pad)
-        self.btn_connect = ttk.Button(row, text="Connect", command=self.on_connect)
-        self.btn_connect.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        self.btn_disconnect = ttk.Button(row, text="Disconnect", command=self.on_disconnect)
-        self.btn_disconnect.pack(side="left", expand=True, fill="x", padx=4)
-        self.btn_rescan = ttk.Button(row, text="Rescan", command=self.on_scan)
-        self.btn_rescan.pack(side="left", expand=True, fill="x", padx=(4, 0))
-
-        vrow = ttk.Frame(root)
-        vrow.pack(fill="x", **pad)
-        ttk.Label(vrow, text="Volume", width=9, font=("Segoe UI", 10, "bold")).pack(side="left")
-        self.vol = tk.IntVar(value=self.settings["volume"])
-        self.vol_lbl = ttk.Label(vrow, text=str(self.vol.get()), width=5, style="Value.TLabel")
-        ttk.Scale(vrow, from_=0, to=100, variable=self.vol, command=self.on_volume_drag, style="Big.Horizontal.TScale").pack(
-            side="left", fill="x", expand=True, pady=6
-        )
-        self.vol_lbl.pack(side="left")
+        self.rainbow = tk.BooleanVar(value=self.settings["rainbow"])
+        self.auto_fix = tk.BooleanVar(value=self.settings.get("auto_fix", True))
+        self.proto = tk.StringVar(value=self.settings["protocol"])
+        self.show_log = tk.BooleanVar(value=False)
+        self.status = tk.StringVar(value="Looking for speakers...")
+        self.state = "idle"  # idle | connecting | playing
+        self.names = []
+        self.selected = set(self.settings.get("last_devices", []))
         self._vol_job = None
 
-        lrow = ttk.Frame(root)
-        lrow.pack(fill="x", **pad)
-        ttk.Label(lrow, text="Delay (ms)", width=9, font=("Segoe UI", 10, "bold")).pack(side="left")
-        self.lat = tk.IntVar(value=self.settings["latency_ms"])
-        self.lat_lbl = ttk.Label(lrow, text=str(self.lat.get()), width=5, style="Value.TLabel")
-        ttk.Scale(lrow, from_=250, to=2000, variable=self.lat, command=self.on_latency_drag, style="Big.Horizontal.TScale").pack(
-            side="left", fill="x", expand=True, pady=6
-        )
-        self.lat_lbl.pack(side="left")
-        ttk.Label(
-            root,
-            text="Lower = less lag. If sound cuts out, raise it. Applies on next Connect.",
-            style="Hint.TLabel",
-            wraplength=400,
-        ).pack(anchor="w", padx=12)
-
-        prow = ttk.Frame(root)
-        prow.pack(fill="x", **pad)
-        ttk.Label(prow, text="Mode", width=9).pack(side="left")
-        self.proto = tk.StringVar(value=self.settings["protocol"])
-        ttk.Combobox(
-            prow,
-            textvariable=self.proto,
-            state="readonly",
-            values=["AirPlay 2", "Auto", "AirPlay 1"],
-            width=12,
-        ).pack(side="left")
-        self.rainbow = tk.BooleanVar(value=self.settings["rainbow"])
-        ttk.Checkbutton(prow, text="Rainbow theme", variable=self.rainbow, command=self.apply_theme).pack(
-            side="right"
-        )
-
-        self.status = tk.StringVar(value="Starting...")
-        ttk.Label(root, textvariable=self.status, wraplength=400, style="Status.TLabel").pack(
-            anchor="w", padx=12, pady=(10, 4)
-        )
-
-        lhead = ttk.Frame(root)
-        lhead.pack(fill="x", padx=12)
-        ttk.Label(lhead, text="Log").pack(side="left")
-        ttk.Button(lhead, text="Copy log", command=self.copy_log).pack(side="right")
-        self.btn_update = ttk.Button(lhead, text="Check for update", command=self.on_update)
-        self.btn_update.pack(side="right", padx=(0, 6))
-        ttk.Button(lhead, text="GitHub page", command=self.open_repo).pack(side="right", padx=(0, 6))
-        self.log_box = tk.Text(root, height=10, wrap="word", font=("Consolas", 8))
-        self.log_box.pack(fill="both", expand=True, padx=12, pady=(4, 8))
-
-        self.bottom_stripe = tk.Canvas(root, height=0, highlightthickness=0, bd=0)
-        self.bottom_stripe.pack(fill="x", side="bottom", before=lhead)
-        for c in (self.top_stripe, self.bottom_stripe):
-            c.bind("<Configure>", lambda e, c=c: self._draw_stripe(c))
-
-        self.apply_theme()
+        root.geometry("420x780")
+        root.minsize(380, 560)
+        self.body = None
+        self.build()
 
         self.backend = Backend(self.log, self.set_status)
+        self.backend.auto_fix = self.auto_fix.get()
+        self.backend.on_delay_change = lambda v: self.root.after(0, lambda: self._delay_changed(v))
         self.log(
             f"{APP_NAME} {APP_VERSION} build {BUILD_NUMBER} | {platform.platform()} | "
             f"Python {platform.python_version()} | pyatv {pyatv.const.__version__}"
@@ -684,61 +832,205 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.on_scan()
 
-    # theme
-    def _draw_stripe(self, canvas):
-        canvas.delete("all")
-        if not self.rainbow.get():
-            return
-        w = max(1, canvas.winfo_width())
-        h = int(canvas.cget("height"))
-        step = w / len(RAINBOW)
-        for i, col in enumerate(RAINBOW):
-            canvas.create_rectangle(i * step, 0, (i + 1) * step + 1, h, fill=col, outline=col)
+    # ------------------------------------------------------------- layout --
+    def build(self):
+        """(Re)build the whole window. Called again when the theme changes."""
+        if self.body is not None:
+            self.body.destroy()
+        rb = self.rainbow.get()
+        th = self.th = THEMES["rainbow" if rb else "plain"]
+        self.root.configure(bg=th["bg"])
+        self.root.title(f"{APP_NAME} (build {BUILD_NUMBER})" + (" \U0001F308" if rb else ""))
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure("TCombobox", fieldbackground=th["card"], background=th["card"])
 
-    def apply_theme(self):
-        on = self.rainbow.get()
-        s = self.style
-        if on:
-            s.theme_use("clam")
-            s.configure(".", font=("Segoe UI", 9))
-            for name, col in (("Red", RAINBOW[0]), ("Blue", RAINBOW[4]), ("Green", RAINBOW[3])):
-                s.configure(f"{name}.TButton", background=col, foreground="white", bordercolor=col)
-                s.map(f"{name}.TButton", background=[("active", PURPLE)])
-            s.configure("Big.Horizontal.TScale", troughcolor="#E9D5F0", background=PURPLE,
-                        sliderthickness=24, sliderlength=28, troughrelief="flat", borderwidth=0)
-            s.map("Big.Horizontal.TScale", background=[("active", RAINBOW[0])])
-            s.configure("TCheckbutton", indicatorcolor="white")
-            s.map("TCheckbutton", indicatorcolor=[("selected", PURPLE)])
-            s.configure("Status.TLabel", foreground=PURPLE, font=("Segoe UI", 10, "bold"))
-            s.configure("Hint.TLabel", foreground="gray")
-            self.btn_connect.configure(style="Red.TButton")
-            self.btn_disconnect.configure(style="Blue.TButton")
-            self.btn_rescan.configure(style="Green.TButton")
-            self.dev_list.configure(selectbackground=PURPLE, selectforeground="white")
-            self.root.title(f"{APP_NAME} {APP_VERSION} (build {BUILD_NUMBER}) \U0001F308")
-            height = 8
+        body = self.body = tk.Frame(self.root, bg=th["bg"])
+        body.pack(fill="both", expand=True)
+
+        if rb:
+            stripe = tk.Canvas(body, height=6, highlightthickness=0, bd=0)
+            stripe.pack(fill="x")
+            stripe.bind("<Configure>", lambda e: self._stripe(stripe))
+
+        wrap = tk.Frame(body, bg=th["bg"])
+        wrap.pack(fill="both", expand=True, padx=16, pady=(12, 12))
+
+        def lbl(parent, text, size=11, color="text", bold=False, bg="card", **kw):
+            return tk.Label(parent, text=text, bg=th[bg], fg=th[color],
+                            font=(FONT, size, "bold" if bold else "normal"), **kw)
+
+        # title + status
+        tk.Label(wrap, text=APP_NAME, bg=th["bg"], fg=th["text"],
+                 font=(FONT_DISPLAY, 20, "bold")).pack(anchor="w")
+        srow = tk.Frame(wrap, bg=th["bg"])
+        srow.pack(fill="x", pady=(0, 12))
+        self.dot = tk.Canvas(srow, width=10, height=10, bg=th["bg"], highlightthickness=0)
+        self.dot.pack(side="left", padx=(0, 6))
+        tk.Label(srow, textvariable=self.status, bg=th["bg"], fg=th["sub"], font=(FONT, 10),
+                 anchor="w", justify="left", wraplength=360).pack(side="left", fill="x")
+        self._update_dot()
+
+        # speakers
+        lbl(wrap, "SPEAKERS", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
+        self.spk_card = Card(wrap, th)
+        self.spk_card.pack(fill="x", pady=(0, 14))
+        self._render_speakers()
+
+        # sliders
+        sc = Card(wrap, th)
+        sc.pack(fill="x", pady=(0, 14))
+        vrow = tk.Frame(sc.inner, bg=th["card"])
+        vrow.pack(fill="x", padx=12, pady=(6, 2))
+        lbl(vrow, "Volume", 11).pack(side="left")
+        self.vol_lbl = lbl(vrow, str(self.vol.get()), 11, bold=True)
+        self.vol_lbl.pack(side="right")
+        Slider(sc.inner, self.vol, 0, 100, th, command=self.on_volume, rainbow=rb).pack(fill="x", padx=4)
+        lrow = tk.Frame(sc.inner, bg=th["card"])
+        lrow.pack(fill="x", padx=12, pady=(8, 2))
+        lbl(lrow, "Delay", 11).pack(side="left")
+        self.lat_lbl = lbl(lrow, f"{self.lat.get()} ms", 11, bold=True)
+        self.lat_lbl.pack(side="right")
+        Slider(sc.inner, self.lat, 250, 2000, th, step=50, command=self.on_latency, rainbow=rb).pack(fill="x", padx=4)
+        lbl(sc.inner, "Lower = less lag. Raise it if sound cuts out. Applies when you press Play.",
+            9, "sub", wraplength=360, justify="left").pack(anchor="w", padx=12, pady=(2, 8))
+
+        # toggles
+        tc = Card(wrap, th)
+        tc.pack(fill="x", pady=(0, 14))
+        rows = [("Auto-fix choppy sound", self.auto_fix, self.on_auto_fix),
+                ("Stereo pair (left + right)", self.split, self._render_speakers),
+                ("Swap left and right", self.swap, self._render_speakers),
+                ("Rainbow theme", self.rainbow, self.on_theme)]
+        for i, (text, var, cmd) in enumerate(rows):
+            r = tk.Frame(tc.inner, bg=th["card"])
+            r.pack(fill="x", padx=12, pady=6)
+            lbl(r, text, 11).pack(side="left")
+            Toggle(r, var, th, command=cmd).pack(side="right")
+            if i < len(rows) - 1:
+                tk.Frame(tc.inner, bg=th["sep"], height=1).pack(fill="x", padx=(12, 0))
+
+        # play / stop
+        self.play_btn = BigButton(wrap, self._play_text(), th, self.on_play, rainbow=rb)
+        self.play_btn.pack(fill="x", pady=(0, 10))
+
+        # link row
+        links = tk.Frame(wrap, bg=th["bg"])
+        links.pack(pady=(0, 6))
+        for text, cmd in (("Rescan", self.on_scan), ("Check for update", self.on_update),
+                          ("GitHub page", self.open_repo), ("Copy log", self.copy_log)):
+            l = tk.Label(links, text=text, bg=th["bg"], fg=th["accent"], font=(FONT, 10), cursor="hand2")
+            l.pack(side="left", padx=7)
+            l.bind("<Button-1>", lambda e, c=cmd: c())
+
+        # advanced (mode + log), collapsed by default
+        adv = tk.Label(wrap, text=("Hide advanced" if self.show_log.get() else "Advanced"),
+                       bg=th["bg"], fg=th["sub"], font=(FONT, 9), cursor="hand2")
+        adv.pack()
+        adv.bind("<Button-1>", lambda e: (self.show_log.set(not self.show_log.get()), self.build()))
+        if self.show_log.get():
+            ac = Card(wrap, th)
+            ac.pack(fill="both", expand=True, pady=(6, 0))
+            mrow = tk.Frame(ac.inner, bg=th["card"])
+            mrow.pack(fill="x", padx=12, pady=(6, 4))
+            lbl(mrow, "Mode", 10).pack(side="left")
+            ttk.Combobox(mrow, textvariable=self.proto, state="readonly",
+                         values=["AirPlay 2", "Auto", "AirPlay 1"], width=11).pack(side="right")
+            self.log_box = tk.Text(ac.inner, height=9, wrap="word", font=("Consolas", 8),
+                                   bg=th["card"], fg=th["text"], relief="flat", highlightthickness=0)
+            self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+            self.log_box.insert("end", "\n".join(self.log_lines[-300:]) + "\n")
+            self.log_box.see("end")
         else:
-            s.theme_use("clam")
-            s.configure("Big.Horizontal.TScale", troughcolor="#DADADA", background="#0078D7",
-                        sliderthickness=24, sliderlength=28, troughrelief="flat", borderwidth=0)
-            s.map("Big.Horizontal.TScale", background=[("active", "#005A9E")])
-            s.map("TCheckbutton", indicatorcolor=[("selected", "#0078D7")])
-            s.configure("Status.TLabel", foreground="black", font=("Segoe UI", 10, "bold"))
-            s.configure("Hint.TLabel", foreground="gray")
-            for b in (self.btn_connect, self.btn_disconnect, self.btn_rescan):
-                b.configure(style="TButton")
-            self.dev_list.configure(selectbackground="#0078D7", selectforeground="white")
-            self.root.title(f"{APP_NAME} {APP_VERSION} (build {BUILD_NUMBER})")
-            height = 0
-        s.configure("Value.TLabel", font=("Segoe UI", 11, "bold"))
-        for c in (self.top_stripe, self.bottom_stripe):
-            c.configure(height=height)
-            self._draw_stripe(c)
-        if self.settings.get("rainbow") != on:
-            self.settings["rainbow"] = on
-            save_settings(self.settings)
+            self.log_box = None
 
-    # logging
+    def _stripe(self, cv):
+        cv.delete("all")
+        w = cv.winfo_width()
+        seg = w / len(RAINBOW)
+        for i, c in enumerate(RAINBOW):
+            cv.create_rectangle(i * seg, 0, (i + 1) * seg + 1, 6, fill=c, outline=c)
+
+    def _update_dot(self):
+        col = {"playing": self.th["on"], "connecting": "#FF9F0A"}.get(self.state, self.th["muted"])
+        try:
+            self.dot.delete("all")
+            self.dot.create_oval(1, 1, 9, 9, fill=col, outline=col)
+        except tk.TclError:
+            pass
+
+    def _play_text(self):
+        return "Stop" if self.state in ("playing", "connecting") else "Play"
+
+    def _sides(self):
+        """Which side each selected speaker plays, when stereo pair is on."""
+        sel = [n for n in self.names if n in self.selected]
+        if self.split.get() and len(sel) == 2:
+            sides = ["Left", "Right"]
+            if self.swap.get():
+                sides.reverse()
+            return dict(zip(sel, sides))
+        return {}
+
+    def _render_speakers(self):
+        inner = self.spk_card.inner
+        th = self.th
+        for w in inner.winfo_children():
+            w.destroy()
+        if not self.names:
+            tk.Label(inner, text="No speakers found yet - tap Rescan", bg=th["card"], fg=th["sub"],
+                     font=(FONT, 10)).pack(anchor="w", padx=12, pady=10)
+            return
+        sides = self._sides()
+        for i, n in enumerate(self.names):
+            conf = getattr(self, "backend", None) and self.backend.devices.get(n)
+            model = (getattr(conf.device_info, "model_str", "") or "") if conf else ""
+            is_pod = "HomePod" in model
+            on = n in self.selected
+            row = tk.Frame(inner, bg=th["card"], cursor="hand2")
+            row.pack(fill="x", padx=12, pady=7)
+            icon = "\U0001F50A" if is_pod else "\U0001F4FA"
+            parts = [tk.Label(row, text=icon, bg=th["card"], font=(FONT, 12)),
+                     tk.Label(row, text=n, bg=th["card"], fg=th["text"] if (on or is_pod) else th["muted"],
+                              font=(FONT, 11))]
+            parts[0].pack(side="left", padx=(0, 8))
+            parts[1].pack(side="left")
+            if on:
+                parts.append(tk.Label(row, text="✓", bg=th["card"], fg=th["accent"], font=(FONT, 13, "bold")))
+                parts[-1].pack(side="right")
+            if n in sides:
+                parts.append(tk.Label(row, text=sides[n], bg=th["card"], fg=th["sub"], font=(FONT, 9)))
+                parts[-1].pack(side="right", padx=8)
+            for w in [row] + parts:
+                w.bind("<Button-1>", lambda e, name=n: self._toggle_speaker(name))
+            if i < len(self.names) - 1:
+                tk.Frame(inner, bg=th["sep"], height=1).pack(fill="x", padx=(40, 0))
+
+    def _toggle_speaker(self, name):
+        if name in self.selected:
+            self.selected.discard(name)
+        else:
+            self.selected.add(name)
+        self._render_speakers()
+
+    def on_auto_fix(self):
+        self.backend.auto_fix = self.auto_fix.get()
+        self.settings["auto_fix"] = self.auto_fix.get()
+        save_settings(self.settings)
+
+    def _delay_changed(self, v):
+        self.lat.set(v)
+        self.settings["latency_ms"] = v
+        save_settings(self.settings)
+        self.build()
+
+    # -------------------------------------------------------------- theme --
+    def on_theme(self):
+        self.settings["rainbow"] = self.rainbow.get()
+        save_settings(self.settings)
+        self.build()
+
+    # ------------------------------------------------------------ logging --
     def _setup_file_log(self):
         try:
             os.makedirs(SETTINGS_DIR, exist_ok=True)
@@ -767,12 +1059,31 @@ class App:
         while not self.logq.empty():
             line = self.logq.get()
             self.log_lines.append(line)
-            self.log_box.insert("end", line + "\n")
-            self.log_box.see("end")
+            if self.log_box is not None:
+                try:
+                    self.log_box.insert("end", line + "\n")
+                    self.log_box.see("end")
+                except tk.TclError:
+                    pass
         self.root.after(150, self._drain_log)
 
     def set_status(self, text):
-        self.root.after(0, lambda: self.status.set(text))
+        def apply():
+            self.status.set(text)
+            low = text.lower()
+            if low.startswith("playing"):
+                self.state = "playing"
+            elif "connecting" in low or "pairing" in low or "reconnecting" in low:
+                self.state = "connecting"
+            elif low.startswith("disconnected") or "couldn't stay connected" in low:
+                self.state = "idle"
+            self._update_dot()
+            try:
+                self.play_btn.set_text(self._play_text())
+            except tk.TclError:
+                pass
+
+        self.root.after(0, apply)
         self.log(f"Status: {text}")
 
     def copy_log(self):
@@ -781,7 +1092,7 @@ class App:
         self.root.clipboard_append(text)
         self.set_status("Log copied - paste it to Claude")
 
-    # actions
+    # ------------------------------------------------------------ actions --
     def on_scan(self):
         fut = self.backend.submit(self.backend.scan())
 
@@ -792,19 +1103,32 @@ class App:
         fut.add_done_callback(done)
 
     def _fill_devices(self, names):
-        self.dev_list.delete(0, "end")
-        for n in names:
-            self.dev_list.insert("end", n)
-        remembered = [n for n in self.settings.get("last_devices", []) if n in names]
-        homepods = [n for n in names if self.backend.devices.get(n) is not None
-                    and "HomePod" in (getattr(self.backend.devices[n].device_info, "model_str", "") or "")]
-        for n in remembered or homepods or names[:1]:
-            self.dev_list.selection_set(names.index(n))
+        def is_pod(n):
+            return "HomePod" in (getattr(self.backend.devices[n].device_info, "model_str", "") or "")
+
+        names = sorted(names, key=lambda n: (not is_pod(n), n))
+        self.names = names
+        keep = {n for n in self.selected if n in names}
+        if not keep:
+            keep = {n for n in names if "HomePod" in (getattr(self.backend.devices[n].device_info, "model_str", "") or "")}
+        if not keep and names:
+            keep = {names[0]}
+        self.selected = keep
+        self._render_speakers()
+
+    def on_play(self):
+        if self.state in ("playing", "connecting"):
+            self.state = "idle"
+            self.play_btn.set_text("Play")
+            self._update_dot()
+            self.backend.submit(self.backend.disconnect())
+        else:
+            self.on_connect()
 
     def on_connect(self):
-        names = [self.dev_list.get(i) for i in self.dev_list.curselection()]
+        names = [n for n in self.names if n in self.selected]
         if not names:
-            self.set_status("Pick at least one speaker")
+            self.set_status("Tap at least one speaker")
             return
         if self.split.get() and len(names) == 2:
             channels = ["left", "right"]
@@ -815,6 +1139,7 @@ class App:
                 self.log("Stereo pair needs exactly 2 speakers - playing full stereo on each")
             channels = ["both"] * len(names)
         LATENCY_MS["value"] = self.lat.get()
+        Timeline.READ_DELAY = 0.12
         self.settings.update(
             last_devices=names,
             latency_ms=self.lat.get(),
@@ -824,13 +1149,12 @@ class App:
             swap_lr=self.swap.get(),
         )
         save_settings(self.settings)
+        self.state = "connecting"
+        self.play_btn.set_text("Stop")
+        self._update_dot()
         self.backend.submit(self.backend.connect(names, channels, self.proto.get(), self.vol.get()))
 
-    def on_disconnect(self):
-        self.backend.submit(self.backend.disconnect())
-
-    def on_volume_drag(self, _v):
-        v = int(float(self.vol.get()))
+    def on_volume(self, v):
         self.vol_lbl.config(text=str(v))
         if self._vol_job:
             self.root.after_cancel(self._vol_job)
@@ -841,10 +1165,8 @@ class App:
         save_settings(self.settings)
         self.backend.submit(self.backend.set_volume(v))
 
-    def on_latency_drag(self, _v):
-        v = int(round(float(self.lat.get()) / 50) * 50)
-        self.lat.set(v)
-        self.lat_lbl.config(text=str(v))
+    def on_latency(self, v):
+        self.lat_lbl.config(text=f"{v} ms")
 
     def open_repo(self):
         import webbrowser
@@ -852,7 +1174,6 @@ class App:
         webbrowser.open(f"https://github.com/{REPO}/releases/latest")
 
     def on_update(self):
-        self.btn_update.configure(state="disabled")
         self.set_status("Checking for updates...")
 
         def work():
@@ -868,8 +1189,6 @@ class App:
             except Exception as ex:
                 self.log(f"Update failed: {ex!r}")
                 self.set_status("Update failed - see log")
-            finally:
-                self.root.after(0, lambda: self.btn_update.configure(state="normal"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -881,6 +1200,8 @@ class App:
             stereo_split=self.split.get(),
             swap_lr=self.swap.get(),
             rainbow=self.rainbow.get(),
+            auto_fix=self.auto_fix.get(),
+            last_devices=[n for n in self.names if n in self.selected] or self.settings.get("last_devices", []),
         )
         save_settings(self.settings)
         try:
