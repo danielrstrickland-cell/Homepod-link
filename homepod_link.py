@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_SAMPLE = 2
@@ -84,15 +84,17 @@ StreamContext.reset = _patched_reset
 class LiveBuffer:
     """Thread-safe PCM buffer between the capture thread and the sender."""
 
-    def __init__(self, max_ms=120):
+    def __init__(self, max_ms=200):
         self._lock = threading.Lock()
         self._buf = bytearray()
         self.max_bytes = int(SAMPLE_RATE * max_ms / 1000) * FRAME_BYTES
         self.dropped = 0
         self.underruns = 0
+        self.captured = 0
 
     def push(self, data: bytes):
         with self._lock:
+            self.captured += len(data) // FRAME_BYTES
             self._buf.extend(data)
             # Keep latency bounded: if capture runs ahead (clock drift), drop oldest.
             extra = len(self._buf) - self.max_bytes
@@ -202,7 +204,7 @@ class LoopbackCapture(threading.Thread):
                             data = np.repeat(data, 2, axis=1)
                         elif data.shape[1] > 2:
                             data = data[:, :2]
-                        pcm = (np.clip(data, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+                        pcm = (np.clip(data, -1.0, 1.0) * 32767).astype(">i2").tobytes()
                         self.buf.push(pcm)
                         # Restart if the user switched default output device.
                         if sc.default_speaker().name != self.device_name:
@@ -281,6 +283,8 @@ class Backend:
             except asyncio.CancelledError:
                 break
             except Exception as ex:
+                if my_gen != self.gen:
+                    return  # user disconnected or switched speakers
                 self.log(f"Stream error: {ex!r}")
                 self.log(traceback.format_exc().strip())
                 cause = ex.__cause__ or ex.__context__
@@ -310,6 +314,7 @@ class Backend:
         )
         self.atv = await pyatv.connect(conf, self.loop, protocol=Protocol.RAOP, storage=storage)
         self.buf.clear()
+        self.buf.dropped = self.buf.underruns = self.buf.captured = 0
         _live_holder["source"] = LiveSource(self.buf)
         if self.capture is None or not self.capture.is_alive():
             self.capture = LoopbackCapture(self.buf, self.log)
@@ -335,7 +340,8 @@ class Backend:
             confirm_task.cancel()
         self.log(
             f"Stream ended after {time.monotonic() - started:.1f} s "
-            f"(underruns={self.buf.underruns}, dropped frames={self.buf.dropped})"
+            f"(underruns={self.buf.underruns}, dropped frames={self.buf.dropped}, "
+            f"capture rate={self.buf.captured / max(0.1, time.monotonic() - started):.0f} Hz)"
         )
         if my_gen == self.gen:
             self.connected_name = None
