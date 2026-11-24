@@ -553,7 +553,6 @@ class App:
         for c in (self.top_stripe, self.bottom_stripe):
             c.bind("<Configure>", lambda e, c=c: self._draw_stripe(c))
 
-        self.style.configure("Value.TLabel", font=("Segoe UI", 11, "bold"))
         self.apply_theme()
 
         self.backend = Backend(self.log, self.set_status)
@@ -611,6 +610,7 @@ class App:
             self.dev_list.configure(selectbackground="#0078D7", selectforeground="white")
             self.root.title(f"{APP_NAME} {APP_VERSION}")
             height = 0
+        s.configure("Value.TLabel", font=("Segoe UI", 11, "bold"))
         for c in (self.top_stripe, self.bottom_stripe):
             c.configure(height=height)
             self._draw_stripe(c)
