@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -52,6 +52,7 @@ DEFAULTS = {
     "rainbow": True,
     "auto_fix": True,
     "send_reports": True,
+    "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
     "settings_rev": 2,
 }
 
@@ -325,16 +326,33 @@ _sc.ControlClient._retransmit_lost_packets = _counting_retx
 
 
 class LoopbackCapture(threading.Thread):
-    """Records the default Windows output via WASAPI loopback and fans the
-    audio out to every connected speaker's buffer."""
+    """Records the chosen source (default output via WASAPI loopback, or a
+    specific device such as Virtual Audio Cable "Line 1") into the timeline."""
 
-    def __init__(self, log):
+    def __init__(self, log, source=""):
         super().__init__(daemon=True)
         self.log = log
         self._stop_evt = threading.Event()
+        self._restart = threading.Event()
         self._lock = threading.Lock()
         self.buffers = []
         self.device_name = "?"
+        self.source = source  # "" = default output (everything); else a device name
+
+    def set_source(self, name):
+        if name != self.source:
+            self.source = name
+            self._restart.set()
+
+    def _open(self, sc):
+        """Pick the capture device: a named source (e.g. Line 1) or default output."""
+        if self.source:
+            for m in sc.all_microphones(include_loopback=True):
+                if source_label(m) == self.source:
+                    return m, self.source
+            self.log(f"Source '{self.source}' not found - using default output for now")
+        speaker = sc.default_speaker()
+        return sc.get_microphone(id=str(speaker.name), include_loopback=True), speaker.name
 
     def add(self, buf):
         with self._lock:
@@ -359,10 +377,11 @@ class LoopbackCapture(threading.Thread):
             return
         while not self._stop_evt.is_set():
             try:
-                speaker = sc.default_speaker()
-                self.device_name = speaker.name
-                mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-                self.log(f"Capturing from: {speaker.name}")
+                self._restart.clear()
+                mic, label = self._open(sc)
+                following_default = not self.source or label == sc.default_speaker().name
+                self.device_name = sc.default_speaker().name
+                self.log(f"Capturing from: {label}")
                 block = 220  # 5 ms blocks keep capture latency low
                 with mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS, blocksize=block) as rec:
                     checks = 0
@@ -376,14 +395,42 @@ class LoopbackCapture(threading.Thread):
                             data = data[:, :2]
                         self._fan_out(data)
                         checks += 1
-                        if checks >= 100:  # about once a second
+                        if self._restart.is_set():
+                            self.log("Audio source changed, restarting capture")
+                            break
+                        if checks >= 200:  # about once a second
                             checks = 0
-                            if sc.default_speaker().name != self.device_name:
+                            if following_default and sc.default_speaker().name != self.device_name:
                                 self.log("Default output changed, restarting capture")
                                 break
             except Exception as ex:
                 self.log(f"Capture error: {ex!r} - retrying in 2 s")
                 time.sleep(2)
+
+
+def source_label(m):
+    return f"{m.name} (what it plays)" if getattr(m, "isloopback", False) else f"{m.name} (input)"
+
+
+def list_sources():
+    """Capture devices: inputs (e.g. Line 1) and loopbacks of every output."""
+    try:
+        import soundcard as sc
+
+        return [source_label(m) for m in sc.all_microphones(include_loopback=True)]
+    except Exception:
+        return []
+
+
+def find_line1(sources):
+    """Prefer Virtual Audio Cable's Line 1 recording endpoint if present."""
+    for lab in sources:
+        if "line 1" in lab.lower() and lab.endswith("(input)"):
+            return lab
+    for lab in sources:
+        if "line 1" in lab.lower():
+            return lab
+    return ""
 
 
 # ------------------------------------------------------------------ backend --
@@ -413,6 +460,7 @@ class Backend:
         self.auto_fix = True
         self.on_delay_change = None  # UI callback when auto-fix raises the delay
         self._last_args = None
+        self.source = ""
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -465,7 +513,7 @@ class Backend:
         self._last_args = (names, channels, protocol_label, volume)
         asyncio.ensure_future(self._health_monitor(my_gen))
         if self.capture is None or not self.capture.is_alive():
-            self.capture = LoopbackCapture(self.log)
+            self.capture = LoopbackCapture(self.log, self.source)
             self.capture.start()
         tasks = []
         for name, channel in zip(names, channels):
@@ -606,6 +654,11 @@ class Backend:
             except Exception:
                 pass
             sess.atv = None
+
+    def set_source(self, name):
+        self.source = name
+        if self.capture and self.capture.is_alive():
+            self.capture.set_source(name)
 
     async def set_volume(self, volume):
         for sess in list(self.sessions.values()):
@@ -987,7 +1040,7 @@ class App:
         self.selected = set(self.settings.get("last_devices", []))
         self._vol_job = None
 
-        root.geometry("440x820")
+        root.geometry("440x880")
         root.minsize(380, 560)
         self.body = None
         self.build()
@@ -996,6 +1049,13 @@ class App:
         self.reporter.enabled = self.send_reports.get()
         self.backend = Backend(self.log, self.set_status)
         self.backend.auto_fix = self.auto_fix.get()
+        if self.settings.get("source") is None:
+            line1 = find_line1(list_sources())
+            self.settings["source"] = line1
+            save_settings(self.settings)
+            if line1:
+                self.root.after(500, self.build)
+        self.backend.source = self.settings.get("source") or ""
         self.backend.on_delay_change = lambda v, apply_now=True: self.root.after(
             0, lambda: self._delay_changed(v, apply_now)
         )
@@ -1051,6 +1111,19 @@ class App:
         self.spk_card = Card(wrap, th)
         self.spk_card.pack(fill="x", pady=(0, 14))
         self._render_speakers()
+
+        # audio source
+        lbl(wrap, "AUDIO SOURCE", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
+        src_card = Card(wrap, th)
+        src_card.pack(fill="x", pady=(0, 14))
+        srow2 = tk.Frame(src_card.inner, bg=th["card"], cursor="hand2")
+        srow2.pack(fill="x", padx=12, pady=8)
+        a = lbl(srow2, self._source_label(), 11)
+        a.pack(side="left")
+        b = lbl(srow2, "Change \u203a", 10, "accent")
+        b.pack(side="right")
+        for w in (srow2, a, b):
+            w.bind("<Button-1>", lambda e, anchor=srow2: self._source_menu(anchor))
 
         # sliders
         sc = Card(wrap, th)
@@ -1191,8 +1264,38 @@ class App:
 
     def on_auto_fix(self):
         self.backend.auto_fix = self.auto_fix.get()
+        if self.settings.get("source") is None:
+            line1 = find_line1(list_sources())
+            self.settings["source"] = line1
+            save_settings(self.settings)
+            if line1:
+                self.root.after(500, self.build)
+        self.backend.source = self.settings.get("source") or ""
         self.settings["auto_fix"] = self.auto_fix.get()
         save_settings(self.settings)
+
+    def _source_label(self):
+        src = self.settings.get("source") or ""
+        if not src:
+            return "Everything the PC plays"
+        return src if len(src) <= 38 else src[:36] + "\u2026"
+
+    def _source_menu(self, anchor):
+        sources = list_sources()
+        m = tk.Menu(self.root, tearoff=0, font=(FONT, 10))
+        m.add_command(label="Everything the PC plays (default output)", command=lambda: self._set_source(""))
+        if sources:
+            m.add_separator()
+        for label in sources:
+            m.add_command(label=label, command=lambda n=label: self._set_source(n))
+        m.tk_popup(anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height())
+
+    def _set_source(self, name):
+        self.settings["source"] = name
+        save_settings(self.settings)
+        self.backend.set_source(name)
+        self.log(f"Audio source set to: {name or 'default output'}")
+        self.build()
 
     def on_send_reports(self):
         self.reporter.enabled = self.send_reports.get()

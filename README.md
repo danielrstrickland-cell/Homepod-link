@@ -18,7 +18,8 @@ The first time it runs, allow it through the Windows Firewall on **Private netwo
 3. Tap one or more speakers (all HomePods are selected by default) and hit **Connect**. Everything the PC plays now comes out of them.
    - **Stereo pair (left + right):** with exactly 2 speakers picked, one plays the left channel and the other the right. **Swap L/R** if they're backwards.
    - Without it, each speaker plays full stereo.
-4. **Volume** controls the HomePod.
+4. **Audio source** sets what gets sent. Leave it on *Everything the PC plays*, or pick a single device such as Virtual Audio Cable's **Line 1 (input)**. Then only apps you route to Line 1 go to the HomePods. Line 1 is picked automatically the first time if it's installed.
+5. **Volume** controls the HomePod.
 5. **Delay** sets the buffer: lower means less lag, but go too low and sound cuts out. Start at 500 ms and work down. Changes apply on the next Connect.
 6. **Rainbow theme** switches between the rainbow look and the plain Windows look. It's remembered between launches.
 7. **Mode** is AirPlay 2 by default. Auto and AirPlay 1 are there for troubleshooting.
