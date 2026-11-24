@@ -664,6 +664,7 @@ class App:
         ttk.Button(lhead, text="Copy log", command=self.copy_log).pack(side="right")
         self.btn_update = ttk.Button(lhead, text="Check for update", command=self.on_update)
         self.btn_update.pack(side="right", padx=(0, 6))
+        ttk.Button(lhead, text="GitHub page", command=self.open_repo).pack(side="right", padx=(0, 6))
         self.log_box = tk.Text(root, height=10, wrap="word", font=("Consolas", 8))
         self.log_box.pack(fill="both", expand=True, padx=12, pady=(4, 8))
 
@@ -844,6 +845,11 @@ class App:
         v = int(round(float(self.lat.get()) / 50) * 50)
         self.lat.set(v)
         self.lat_lbl.config(text=str(v))
+
+    def open_repo(self):
+        import webbrowser
+
+        webbrowser.open(f"https://github.com/{REPO}/releases/latest")
 
     def on_update(self):
         self.btn_update.configure(state="disabled")
