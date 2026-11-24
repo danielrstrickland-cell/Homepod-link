@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 SAMPLE_RATE = 44100
@@ -632,10 +632,13 @@ def download_and_restart(url, log):
     with open(bat, "w") as f:
         f.write(
             "@echo off\r\n"
-            f"set PID={os.getpid()}\r\n"
-            ":wait\r\n"
-            'tasklist /FI "PID eq %PID%" | find "%PID%" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n'
-            f'move /Y "{new_path}" "{exe}" >nul\r\n'
+            "set N=0\r\n"
+            ":retry\r\n"
+            "ping -n 2 127.0.0.1 >nul\r\n"
+            # The exe stays locked until both PyInstaller processes exit, so keep
+            # trying the swap (up to ~60 s) instead of trying once.
+            f'move /Y "{new_path}" "{exe}" >nul 2>&1\r\n'
+            "if errorlevel 1 (set /a N+=1 & if %N% LSS 60 goto retry)\r\n"
             f'start "" "{exe}"\r\n'
             'del "%~f0"\r\n'
         )
