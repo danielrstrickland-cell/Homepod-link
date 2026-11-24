@@ -36,6 +36,13 @@ With **Auto-fix choppy sound** on (default):
 - If PC audio arrives late, it reads a little further back with no interruption.
 - If a speaker drops, it keeps reconnecting on its own.
 
+## Security
+
+- **Encrypted audio:** always AirPlay 2. Every audio packet is encrypted with ChaCha20-Poly1305, using a key from a fresh X25519 pairing each session. The app refuses to send audio if encryption isn't active. AirPlay 1, which sends plain audio, is disabled.
+- **Verified updates:** each release publishes the SHA-256 of its exe, and the app won't install an update that doesn't match.
+- **Private reports:** IP addresses and the Windows user name are removed before a report is sent. Reports go over HTTPS with an issues-only key.
+- **On your side:** keep the Wi-Fi on WPA2 or WPA3 with a strong password. Anyone you let onto the network can see the speakers, the same as with any AirPlay device.
+
 ## HomePod settings that matter
 
 In the Home app: **Home Settings → Speakers & TV → Allow Speaker & TV Access** set to **Everyone** or **Anyone On the Same Network**, and **Require Password** off.

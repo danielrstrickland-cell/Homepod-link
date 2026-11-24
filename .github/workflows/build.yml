@@ -45,6 +45,10 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name HomePodLink
           --collect-all pyatv --collect-all soundcard --collect-all miniaudio
           homepod_link.py
+      - name: Checksum
+        id: sum
+        shell: bash
+        run: echo "sha=$(sha256sum dist/HomePodLink.exe | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: HomePodLink
@@ -55,3 +59,7 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: HomePod Link build ${{ github.run_number }}
           files: dist/HomePodLink.exe
+          body: |
+            Download **HomePodLink.exe** below, or use **Update** inside the app.
+
+            sha256: ${{ steps.sum.outputs.sha }}

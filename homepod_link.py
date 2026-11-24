@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -114,6 +114,21 @@ async def _patched_rtsp_setup(self, *args, **kwargs):
 
 
 RtspSession.setup = _patched_rtsp_setup
+
+# Security: AirPlay 2 encrypts every audio packet (ChaCha20-Poly1305, key from the
+# per-session X25519 pairing). Refuse to send anything if encryption isn't active.
+from pyatv.protocols.raop.protocols import airplayv2 as _ap2  # noqa: E402
+
+_orig_send_audio = _ap2.AirPlayV2.send_audio_packet
+
+
+async def _encrypted_only(self, transport, rtp_header, audio):
+    if not getattr(self, "_cipher", None):
+        raise RuntimeError("Refusing to stream: audio encryption is not active")
+    return await _orig_send_audio(self, transport, rtp_header, audio)
+
+
+_ap2.AirPlayV2.send_audio_packet = _encrypted_only
 
 # ------------------------------------------------------------- audio source --
 
@@ -413,7 +428,7 @@ class Backend:
         waiting = [s.name for s in self.sessions.values() if not s.playing]
         parts = []
         if playing:
-            parts.append("Playing on " + " + ".join(playing))
+            parts.append("\U0001F512 Playing on " + " + ".join(playing))
         if waiting:
             parts.append("connecting " + " + ".join(waiting))
         self.on_status(" | ".join(parts))
@@ -497,10 +512,8 @@ class Backend:
         conf = self.devices[sess.name]
         storage = MemoryStorage()
         settings = await storage.get_settings(conf)
-        settings.protocols.raop.protocol_version = {
-            "AirPlay 2": AirPlayVersion.V2,
-            "AirPlay 1": AirPlayVersion.V1,
-        }.get(protocol_label, AirPlayVersion.Auto)
+        # Always AirPlay 2: it's the only mode with encrypted audio.
+        settings.protocols.raop.protocol_version = AirPlayVersion.V2
         self.log(
             f"Connect attempt {attempt}: {sess.name} ({sess.channel}), "
             f"protocol={protocol_label}, latency={LATENCY_MS['value']} ms"
@@ -622,6 +635,9 @@ class Backend:
 # ------------------------------------------------------------------ updates --
 
 
+LAST_RELEASE_SHA = {"value": None}
+
+
 def fetch_latest_release():
     """Return (build_number, exe_url, release_name) of the newest GitHub release."""
     import urllib.request
@@ -632,6 +648,10 @@ def fetch_latest_release():
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         rel = json.load(r)
+    import re
+
+    m = re.search(r"sha256:\s*([0-9a-fA-F]{64})", rel.get("body") or "")
+    LAST_RELEASE_SHA["value"] = m.group(1).lower() if m else None
     tag = rel.get("tag_name", "")
     num = int(tag.split("-")[-1]) if tag.split("-")[-1].isdigit() else 0
     url = next(
@@ -659,7 +679,19 @@ def download_and_restart(url, log):
                 break
             f.write(chunk)
     if os.path.getsize(new_path) < 1_000_000:
+        os.remove(new_path)
         raise RuntimeError("Download looks incomplete")
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(new_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    expected = LAST_RELEASE_SHA["value"]
+    if not expected or h.hexdigest() != expected:
+        os.remove(new_path)
+        raise RuntimeError("Update failed its security check (checksum mismatch) - not installed")
+    log("Update checksum verified")
     log(f"Downloaded update ({os.path.getsize(new_path) // 1_000_000} MB), restarting")
     bat = os.path.join(tempfile.gettempdir(), "homepodlink_update.bat")
     with open(bat, "w") as f:
@@ -745,10 +777,18 @@ class Reporter:
             reasons, self.pending = self.pending, []
             self.last_post = time.time()
             self.posts += 1
-        lines = self.get_log_lines()[-150:]
+        import re
+
+        def scrub(t):
+            t = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "[ip]", t)
+            t = re.sub(r"(?i)([A-Z]:\\Users\\)[^\\]+", r"\1[user]", t)
+            return t
+
+        lines = [scrub(x) for x in self.get_log_lines()[-150:]]
+        reasons = [scrub(r) for r in reasons]
         body = (
             "**Why:**\n" + "\n".join(f"- {r}" for r in reasons)
-            + f"\n\n**App:** {APP_NAME} {APP_VERSION} build {BUILD_NUMBER} on {platform.platform()}"
+            + f"\n\n**App:** {APP_NAME} {APP_VERSION} build {BUILD_NUMBER} on {platform.system()} {platform.release()}"
             + "\n\n<details><summary>Log (last 150 lines)</summary>\n\n```\n"
             + "\n".join(lines)[-60000:]
             + "\n```\n</details>"
@@ -939,7 +979,7 @@ class App:
         self.rainbow = tk.BooleanVar(value=self.settings["rainbow"])
         self.auto_fix = tk.BooleanVar(value=self.settings.get("auto_fix", True))
         self.send_reports = tk.BooleanVar(value=self.settings.get("send_reports", True))
-        self.proto = tk.StringVar(value=self.settings["protocol"])
+        self.proto = tk.StringVar(value="AirPlay 2")
         self.show_log = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Looking for speakers...")
         self.state = "idle"  # idle | connecting | playing
@@ -1070,9 +1110,8 @@ class App:
             ac.pack(fill="both", expand=True, pady=(6, 0))
             mrow = tk.Frame(ac.inner, bg=th["card"])
             mrow.pack(fill="x", padx=12, pady=(6, 4))
-            lbl(mrow, "Mode", 10).pack(side="left")
-            ttk.Combobox(mrow, textvariable=self.proto, state="readonly",
-                         values=["AirPlay 2", "Auto", "AirPlay 1"], width=11).pack(side="right")
+            lbl(mrow, "Connection", 10).pack(side="left")
+            lbl(mrow, "AirPlay 2, encrypted (ChaCha20-Poly1305)", 10, "sub").pack(side="right")
             self.log_box = tk.Text(ac.inner, height=9, wrap="word", font=("Consolas", 8),
                                    bg=th["card"], fg=th["text"], relief="flat", highlightthickness=0)
             self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 8))
@@ -1230,7 +1269,7 @@ class App:
         def apply():
             self.status.set(text)
             low = text.lower()
-            if low.startswith("playing"):
+            if low.lstrip("\U0001F512 ").startswith("playing"):
                 self.state = "playing"
             elif "connecting" in low or "pairing" in low or "reconnecting" in low:
                 self.state = "connecting"
