@@ -35,7 +35,7 @@ The full debug log is saved at `%APPDATA%\HomePodLink\homepod_link.log`.
 - **Visualizer:** live view of what's being sent. Styles: Bars (with peak caps), Mirror, Wave, Dots and Scope (the real waveform). Colors: Theme, Rainbow, Sunset, Ocean, Neon and Mono. Sizes S to XL. Tap the visualizer to cycle styles.
 - **Equalizer:** 5, 10, 16 or 32 bands, adding zero delay. Presets: Flat, Bass boost, Vocal, Loudness, Night and **Sim racing** (engine and kerb rumble up, boxy low-mids down, tyre scrub and spotter calls up). Drag a band to adjust it, double-click to reset it.
 - **Auto Sim racing:** when a racing sim starts (iRacing, ACC, AC/EVO, rFactor 2, LMU, AMS2, RaceRoom, BeamNG, Forza, F1, WRC, DiRT Rally, Project CARS, RBR), the EQ switches to Sim racing. It switches back to your normal sound when the game closes.
-- **Smart EQ:** a small analyser that runs on the PC, listens to the music, identifies its balance (bass-heavy, bright, vocal-forward, speech, balanced) and gently steers the EQ toward a balanced sound. Nothing leaves the PC.
+- **Smart EQ (audiophile):** listens on the PC (nothing leaves it) and compares the long-term tonal balance to a Harman-style in-room target. It corrects only with three broad, smooth moves (bass shelf, tilt and presence), at most ±3 dB, settling over about 30 seconds, so it respects the master and never pumps. It also shows what it hears (bass-heavy, bright, vocal-forward, speech, balanced).
 
 ## Self-correcting
 

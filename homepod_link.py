@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -572,17 +572,27 @@ class Equalizer:
         edges = np.concatenate([[f[0] / 1.4], edges, [f[-1] * 1.4]])
         bands = np.array([spec[(fr >= lo) & (fr < hi)].sum() + 1e-12 for lo, hi in zip(edges[:-1], edges[1:])])
         db = 10 * np.log10(bands)
-        self._avg = db if self._avg is None or len(self._avg) != len(db) else 0.97 * self._avg + 0.03 * db
+        self._avg = db if self._avg is None or len(self._avg) != len(db) else 0.99 * self._avg + 0.01 * db
         now = time.monotonic()
         if now - self._last_smart < 2:
             return
         self._last_smart = now
-        # Target: gently tilted "pink" balance (a little more low end, like a good speaker tuning).
-        target = np.array([curve_db([(20, 3), (100, 2), (1000, 0), (8000, -1), (20000, -2)], fq) for fq in f])
+        # Audiophile target: Harman-style in-room curve (gentle bass shelf, smooth
+        # downward tilt). Relative to pink noise, which is how music energy is measured.
+        target = np.array([curve_db([(20, 4), (60, 4), (200, 1), (1000, 0), (10000, -3), (20000, -5)], fq)
+                           for fq in f])
         dev = (self._avg - self._avg.mean()) - (target - target.mean())
-        corr = np.clip(-0.6 * dev, -6, 6)
-        corr -= corr.mean()  # shape only, don't change loudness
-        self.auto = np.clip(0.7 * self.auto + 0.3 * corr, -6, 6)
+        # Fit only three broad, smooth controls - never narrow per-band fixes, which
+        # would colour the sound: a low shelf, an overall tilt, and a presence bump.
+        lf = np.log2(f / 1000.0)
+        shelf = 1 / (1 + (f / 150.0) ** 2)  # 1 in the bass, 0 above ~300 Hz
+        tilt = lf / np.max(np.abs(lf))
+        pres = np.exp(-((lf - np.log2(3)) ** 2) / 0.8)  # broad bump around 3 kHz
+        basis = np.column_stack([shelf, tilt, pres, np.ones_like(f)])
+        coef, *_ = np.linalg.lstsq(basis, -dev, rcond=None)
+        corr = basis[:, :3] @ np.clip(coef[:3], -3, 3)
+        corr = np.clip(corr - corr.mean(), -3, 3)  # shape only, small: respect the master
+        self.auto = 0.85 * self.auto + 0.15 * corr  # slow: settles over ~30 s, never pumps
         self.style = self._classify(fr, spec, dev, f)
         self._rebuild(keep_state=True)
 
@@ -1501,7 +1511,7 @@ class App:
         ec = Card(wrap, th)
         ec.pack(fill="both", expand=True)
         for i, (text, var, cmd) in enumerate((("Equalizer", self.eq_on, self._eq_toggle),
-                                              ("Smart EQ (learns the music)", self.smart_eq, self._eq_toggle),
+                                              ("Smart EQ (audiophile, Harman target)", self.smart_eq, self._eq_toggle),
                                               ("Auto Sim racing when a sim starts", self.auto_sim, self._auto_sim_toggle))):
             r = tk.Frame(ec.inner, bg=th["card"])
             r.pack(fill="x", padx=12, pady=5)
