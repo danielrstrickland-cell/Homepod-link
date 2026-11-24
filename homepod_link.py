@@ -495,22 +495,22 @@ class App:
 
         vrow = ttk.Frame(root)
         vrow.pack(fill="x", **pad)
-        ttk.Label(vrow, text="Volume", width=9).pack(side="left")
+        ttk.Label(vrow, text="Volume", width=9, font=("Segoe UI", 10, "bold")).pack(side="left")
         self.vol = tk.IntVar(value=self.settings["volume"])
-        self.vol_lbl = ttk.Label(vrow, text=str(self.vol.get()), width=5)
-        ttk.Scale(vrow, from_=0, to=100, variable=self.vol, command=self.on_volume_drag).pack(
-            side="left", fill="x", expand=True
+        self.vol_lbl = ttk.Label(vrow, text=str(self.vol.get()), width=5, style="Value.TLabel")
+        ttk.Scale(vrow, from_=0, to=100, variable=self.vol, command=self.on_volume_drag, style="Big.Horizontal.TScale").pack(
+            side="left", fill="x", expand=True, pady=6
         )
         self.vol_lbl.pack(side="left")
         self._vol_job = None
 
         lrow = ttk.Frame(root)
         lrow.pack(fill="x", **pad)
-        ttk.Label(lrow, text="Delay (ms)", width=9).pack(side="left")
+        ttk.Label(lrow, text="Delay (ms)", width=9, font=("Segoe UI", 10, "bold")).pack(side="left")
         self.lat = tk.IntVar(value=self.settings["latency_ms"])
-        self.lat_lbl = ttk.Label(lrow, text=str(self.lat.get()), width=5)
-        ttk.Scale(lrow, from_=250, to=2000, variable=self.lat, command=self.on_latency_drag).pack(
-            side="left", fill="x", expand=True
+        self.lat_lbl = ttk.Label(lrow, text=str(self.lat.get()), width=5, style="Value.TLabel")
+        ttk.Scale(lrow, from_=250, to=2000, variable=self.lat, command=self.on_latency_drag, style="Big.Horizontal.TScale").pack(
+            side="left", fill="x", expand=True, pady=6
         )
         self.lat_lbl.pack(side="left")
         ttk.Label(
@@ -553,6 +553,7 @@ class App:
         for c in (self.top_stripe, self.bottom_stripe):
             c.bind("<Configure>", lambda e, c=c: self._draw_stripe(c))
 
+        self.style.configure("Value.TLabel", font=("Segoe UI", 11, "bold"))
         self.apply_theme()
 
         self.backend = Backend(self.log, self.set_status)
@@ -584,7 +585,9 @@ class App:
             for name, col in (("Red", RAINBOW[0]), ("Blue", RAINBOW[4]), ("Green", RAINBOW[3])):
                 s.configure(f"{name}.TButton", background=col, foreground="white", bordercolor=col)
                 s.map(f"{name}.TButton", background=[("active", PURPLE)])
-            s.configure("Horizontal.TScale", troughcolor="#E9D5F0", background=PURPLE)
+            s.configure("Big.Horizontal.TScale", troughcolor="#E9D5F0", background=PURPLE,
+                        sliderthickness=24, sliderlength=28, troughrelief="flat", borderwidth=0)
+            s.map("Big.Horizontal.TScale", background=[("active", RAINBOW[0])])
             s.configure("TCheckbutton", indicatorcolor="white")
             s.map("TCheckbutton", indicatorcolor=[("selected", PURPLE)])
             s.configure("Status.TLabel", foreground=PURPLE, font=("Segoe UI", 10, "bold"))
@@ -596,7 +599,11 @@ class App:
             self.root.title(f"{APP_NAME} {APP_VERSION} \U0001F308")
             height = 8
         else:
-            s.theme_use(self.default_theme)
+            s.theme_use("clam")
+            s.configure("Big.Horizontal.TScale", troughcolor="#DADADA", background="#0078D7",
+                        sliderthickness=24, sliderlength=28, troughrelief="flat", borderwidth=0)
+            s.map("Big.Horizontal.TScale", background=[("active", "#005A9E")])
+            s.map("TCheckbutton", indicatorcolor=[("selected", "#0078D7")])
             s.configure("Status.TLabel", foreground="black", font=("Segoe UI", 10, "bold"))
             s.configure("Hint.TLabel", foreground="gray")
             for b in (self.btn_connect, self.btn_disconnect, self.btn_rescan):
