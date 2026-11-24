@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -57,6 +57,10 @@ DEFAULTS = {
     "eq_bands": 10,
     "eq_preset": "Flat",
     "eq_gains": None,
+    "auto_sim": True,
+    "viz_size": "M",
+    "viz_style": "Bars",
+    "viz_colors": "Theme",
     "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
     "settings_rev": 2,
 }
@@ -605,6 +609,63 @@ class Equalizer:
 EQ = Equalizer()
 
 
+# ------------------------------------------------------------ sim racing --
+
+# Process names (lower-case) of racing sims. When one is running, the app switches
+# to the Sim racing EQ and switches back when it closes.
+SIM_PROCESSES = {
+    "iracingsim64dx11.exe": "iRacing",
+    "acc.exe": "Assetto Corsa Competizione",
+    "acs.exe": "Assetto Corsa",
+    "acs_x86.exe": "Assetto Corsa",
+    "assettocorsaevo.exe": "Assetto Corsa EVO",
+    "acevo.exe": "Assetto Corsa EVO",
+    "rfactor2.exe": "rFactor 2",
+    "le mans ultimate.exe": "Le Mans Ultimate",
+    "lemansultimate.exe": "Le Mans Ultimate",
+    "ams2avx.exe": "Automobilista 2",
+    "ams2.exe": "Automobilista 2",
+    "rrre64.exe": "RaceRoom",
+    "rrre.exe": "RaceRoom",
+    "beamng.drive.x64.exe": "BeamNG.drive",
+    "beamng.x64.exe": "BeamNG.drive",
+    "forzamotorsport.exe": "Forza Motorsport",
+    "forzahorizon5.exe": "Forza Horizon 5",
+    "forzahorizon6.exe": "Forza Horizon 6",
+    "f1_24.exe": "F1 24",
+    "f1_25.exe": "F1 25",
+    "f1_26.exe": "F1 26",
+    "wrc.exe": "EA Sports WRC",
+    "dirtrally2.exe": "DiRT Rally 2.0",
+    "pcars2avx.exe": "Project CARS 2",
+    "pcars2.exe": "Project CARS 2",
+    "richardburnsrally_sse.exe": "Richard Burns Rally",
+    "gtr2.exe": "GTR 2",
+    "rbr.exe": "Richard Burns Rally",
+}
+
+
+def running_sim():
+    """Return the name of a running racing sim, or None (Windows only)."""
+    if sys.platform != "win32":
+        return None
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=0x08000000,  # no console window
+        ).stdout.lower()
+    except Exception:
+        return None
+    for line in out.splitlines():
+        exe = line.split('","')[0].strip('"')
+        if exe in SIM_PROCESSES:
+            return SIM_PROCESSES[exe]
+    return None
+
+
 # ------------------------------------------------------------------ backend --
 
 
@@ -1044,6 +1105,16 @@ class Reporter:
 # ----------------------------------------------------------------------- UI --
 
 RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
+VIZ_SIZES = {"S": 60, "M": 110, "L": 180, "XL": 260}
+VIZ_STYLES = ("Bars", "Mirror", "Wave", "Dots", "Scope")
+VIZ_PALETTES = {
+    "Theme": None,  # accent colour, or rainbow in the rainbow theme
+    "Rainbow": RAINBOW,
+    "Sunset": ["#FF5F6D", "#FF8A5B", "#FFC371", "#F857A6", "#B24592"],
+    "Ocean": ["#00C6FB", "#0099F7", "#005BEA", "#2E3192"],
+    "Neon": ["#39FF14", "#00FFF0", "#FF00E6", "#FFE600"],
+    "Mono": ["#8E8E93"],
+}
 PURPLE = "#750787"
 
 THEMES = {
@@ -1216,6 +1287,9 @@ class App:
             EQ.apply_preset(self.settings["eq_preset"])
         EQ.enabled, EQ.smart = self.eq_on.get(), self.smart_eq.get()
         self._eq_save_job = None
+        self.auto_sim = tk.BooleanVar(value=self.settings.get("auto_sim", True))
+        self._sim_active = None  # name of the sim we switched for
+        self._sim_saved = None  # EQ state to restore afterwards
         self.status = tk.StringVar(value="Looking for speakers...")
         self.state = "idle"  # idle | connecting | playing
         self.names = []
@@ -1246,6 +1320,7 @@ class App:
             f"Python {platform.python_version()} | pyatv {pyatv.const.__version__}"
         )
         self.root.after(100, self._drain_log)
+        self.root.after(3000, self._sim_watch)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.on_scan()
 
@@ -1398,9 +1473,27 @@ class App:
         lbl(wrap, "VISUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
         vc = Card(wrap, th)
         vc.pack(fill="x", pady=(0, 14))
-        self.viz = tk.Canvas(vc.inner, height=90, bg=th["card"], highlightthickness=0)
-        self.viz.pack(fill="x", padx=12, pady=8)
+        self.viz_h = VIZ_SIZES.get(self.settings.get("viz_size", "M"), 110)
+        self.viz = tk.Canvas(vc.inner, height=self.viz_h, bg=th["card"], highlightthickness=0, cursor="hand2")
+        self.viz.pack(fill="x", padx=12, pady=(8, 4))
+        self.viz.bind("<Button-1>", lambda e: self._viz_set("viz_style", VIZ_STYLES[
+            (VIZ_STYLES.index(self.settings.get("viz_style", "Bars")) + 1) % len(VIZ_STYLES)]))
         self._viz_levels = np.zeros(32)
+        self._viz_peaks = np.zeros(32)
+
+        def chips(parent, key, options, current):
+            row = tk.Frame(parent, bg=th["card"])
+            row.pack(fill="x", padx=10, pady=(0, 4))
+            for o in options:
+                sel = o == current
+                b = tk.Label(row, text=o, bg=th["accent"] if sel else th["off"], fg="white" if sel else th["text"],
+                             font=(FONT, 8), padx=6, pady=2, cursor="hand2")
+                b.pack(side="left", padx=2, fill="x", expand=True)
+                b.bind("<Button-1>", lambda e, o=o: self._viz_set(key, o))
+
+        chips(vc.inner, "viz_style", VIZ_STYLES, self.settings.get("viz_style", "Bars"))
+        chips(vc.inner, "viz_colors", list(VIZ_PALETTES), self.settings.get("viz_colors", "Theme"))
+        chips(vc.inner, "viz_size", list(VIZ_SIZES), self.settings.get("viz_size", "M"))
         self._viz_tick()
 
         # equalizer
@@ -1408,11 +1501,14 @@ class App:
         ec = Card(wrap, th)
         ec.pack(fill="both", expand=True)
         for i, (text, var, cmd) in enumerate((("Equalizer", self.eq_on, self._eq_toggle),
-                                              ("Smart EQ (learns the music)", self.smart_eq, self._eq_toggle))):
+                                              ("Smart EQ (learns the music)", self.smart_eq, self._eq_toggle),
+                                              ("Auto Sim racing when a sim starts", self.auto_sim, self._auto_sim_toggle))):
             r = tk.Frame(ec.inner, bg=th["card"])
             r.pack(fill="x", padx=12, pady=5)
             lbl(r, text, 11).pack(side="left")
             Toggle(r, var, th, command=cmd).pack(side="right")
+        if self._sim_active:
+            lbl(ec.inner, f"\U0001F3CE {self._sim_active} running - Sim racing sound on", 9, "accent").pack(anchor="w", padx=12)
         self.style_lbl = lbl(ec.inner, "", 9, "sub")
         self.style_lbl.pack(anchor="w", padx=12)
         tk.Frame(ec.inner, bg=th["sep"], height=1).pack(fill="x", padx=12, pady=6)
@@ -1520,6 +1616,12 @@ class App:
 
         self._eq_save_job = self.root.after(500, save)
 
+    def _auto_sim_toggle(self):
+        self.settings["auto_sim"] = self.auto_sim.get()
+        save_settings(self.settings)
+        if not self.auto_sim.get() and self._sim_active:
+            self._sim_apply(None)
+
     def _eq_toggle(self):
         EQ.enabled = self.eq_on.get()
         EQ.smart = self.smart_eq.get()
@@ -1567,7 +1669,7 @@ class App:
             return
         try:
             cv = self.viz
-            w, h = cv.winfo_width(), 90
+            w = cv.winfo_width()
         except tk.TclError:
             return
         n = 2048
@@ -1586,13 +1688,97 @@ class App:
                        for lo, hi in zip(edges[:-1], edges[1:])])
         lv = np.clip((20 * np.log10(lv + 1e-9) + 10) / 50, 0, 1)
         self._viz_levels = np.maximum(lv, self._viz_levels * 0.85)  # fast attack, smooth fall
+        self._viz_peaks = np.maximum(self._viz_levels, self._viz_peaks - 0.015)
+        h = self.viz_h
+        style = self.settings.get("viz_style", "Bars")
+        pal = VIZ_PALETTES.get(self.settings.get("viz_colors", "Theme"))
+        if pal is None:
+            pal = RAINBOW if self.rainbow.get() else [self.th["accent"]]
+
+        def col(i, n=32):
+            return pal[min(len(pal) - 1, i * len(pal) // n)]
+
         cv.delete("all")
         bw = w / 32
-        for i, v in enumerate(self._viz_levels):
-            col = RAINBOW[i * len(RAINBOW) // 32] if self.rainbow.get() else self.th["accent"]
-            bh = max(3, v * (h - 6))
-            _round_rect(cv, i * bw + 2, h - bh, (i + 1) * bw - 2, h, 2, fill=col, outline="")
+        lv = self._viz_levels
+        if style == "Bars":
+            for i, v in enumerate(lv):
+                bh = max(3, v * (h - 6))
+                _round_rect(cv, i * bw + 2, h - bh, (i + 1) * bw - 2, h, 2, fill=col(i), outline="")
+                py = h - max(3, self._viz_peaks[i] * (h - 6)) - 3
+                cv.create_line(i * bw + 2, py, (i + 1) * bw - 2, py, fill=col(i), width=2)
+        elif style == "Mirror":
+            mid = h / 2
+            for i, v in enumerate(lv):
+                bh = max(2, v * (mid - 3))
+                _round_rect(cv, i * bw + 2, mid - bh, (i + 1) * bw - 2, mid + bh, 2, fill=col(i), outline="")
+        elif style == "Wave":
+            pts = [(0, h)]
+            for i, v in enumerate(lv):
+                pts.append(((i + 0.5) * bw, h - 3 - v * (h - 8)))
+            pts.append((w, h))
+            flat = [c for p in pts for c in p]
+            cv.create_polygon(flat, smooth=True, fill=col(16), outline="", stipple="gray50")
+            cv.create_line(flat[2:-2], smooth=True, fill=col(4), width=3)
+        elif style == "Dots":
+            rows = max(4, int(h // 12))
+            for i, v in enumerate(lv):
+                lit = int(round(v * rows))
+                for r in range(rows):
+                    y = h - (r + 0.5) * (h / rows)
+                    rr = min(bw, h / rows) * 0.32
+                    cx = (i + 0.5) * bw
+                    on = r < lit
+                    cv.create_oval(cx - rr, y - rr, cx + rr, y + rr,
+                                   fill=col(i) if on else self.th["off"], outline="")
+        else:  # Scope: the actual waveform
+            seg = x[-1024:]
+            peak = max(0.05, float(np.max(np.abs(seg))))
+            pts = []
+            for j in range(0, 1024, 8):
+                pts += [j / 1024 * w, h / 2 - seg[j] / peak * (h / 2 - 4)]
+            cv.create_line(pts, fill=col(8), width=2, smooth=True)
         self.root.after(33, self._viz_tick)
+
+    def _viz_set(self, key, value):
+        self.settings[key] = value
+        save_settings(self.settings)
+        self.build()
+
+    def _sim_watch(self):
+        """Every 5 s: switch to the Sim racing EQ while a racing sim runs."""
+        def check():
+            name = running_sim() if self.auto_sim.get() else None
+            self.root.after(0, lambda: self._sim_apply(name))
+
+        threading.Thread(target=check, daemon=True).start()
+        self.root.after(5000, self._sim_watch)
+
+    def _sim_apply(self, name):
+        if name and not self._sim_active:
+            self._sim_saved = (EQ.enabled, EQ.smart, EQ.manual.copy(), self.settings.get("eq_preset"))
+            self._sim_active = name
+            EQ.smart = False
+            EQ.enabled = True
+            EQ.apply_preset("Sim racing")
+            self.eq_on.set(True)
+            self.smart_eq.set(False)
+            self.settings["eq_preset"] = "Sim racing"
+            self.set_status(f"{name} detected - Sim racing sound on")
+            self.log(f"Sim racing mode: {name} started")
+            self.build()
+        elif not name and self._sim_active:
+            self.log(f"Sim racing mode: {self._sim_active} closed - restoring your sound")
+            enabled, smart, manual, preset = self._sim_saved
+            EQ.set_manual(manual)
+            EQ.enabled, EQ.smart = enabled, smart
+            EQ._rebuild(keep_state=True)
+            self.eq_on.set(enabled)
+            self.smart_eq.set(smart)
+            self.settings["eq_preset"] = preset
+            self._sim_active = self._sim_saved = None
+            self.set_status("Game closed - your normal sound is back")
+            self.build()
 
     def _stripe(self, cv):
         cv.delete("all")
@@ -1911,10 +2097,11 @@ class App:
             rainbow=self.rainbow.get(),
             auto_fix=self.auto_fix.get(),
             send_reports=self.send_reports.get(),
-            eq_on=self.eq_on.get(),
-            smart_eq=self.smart_eq.get(),
+            eq_on=(self._sim_saved[0] if self._sim_saved else self.eq_on.get()),
+            smart_eq=(self._sim_saved[1] if self._sim_saved else self.smart_eq.get()),
+            auto_sim=self.auto_sim.get(),
             eq_bands=EQ.n,
-            eq_gains=[float(g) for g in EQ.manual],
+            eq_gains=[float(g) for g in (self._sim_saved[2] if self._sim_saved else EQ.manual)],
             last_devices=[n for n in self.names if n in self.selected] or self.settings.get("last_devices", []),
         )
         save_settings(self.settings)
