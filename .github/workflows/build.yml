@@ -26,6 +26,20 @@ jobs:
       - name: Stamp build number
         shell: bash
         run: sed -i "s/^BUILD_NUMBER = 0 /BUILD_NUMBER = ${{ github.run_number }} /" homepod_link.py && grep -n "^BUILD_NUMBER" homepod_link.py
+      - name: Stamp report key
+        shell: bash
+        env:
+          REPORT_TOKEN: ${{ secrets.REPORT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, re
+          tok = os.environ.get("REPORT_TOKEN", "")
+          p = "homepod_link.py"
+          s = open(p, encoding="utf-8").read()
+          s = s.replace('REPORT_TOKEN = ""  #', f'REPORT_TOKEN = "{tok}"  #', 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("report key stamped" if tok else "no REPORT_TOKEN secret - reports disabled in this build")
+          PY
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name HomePodLink

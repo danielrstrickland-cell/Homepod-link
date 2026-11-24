@@ -29,9 +29,10 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
+REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_SAMPLE = 2
@@ -50,6 +51,7 @@ DEFAULTS = {
     "swap_lr": False,
     "rainbow": True,
     "auto_fix": True,
+    "send_reports": True,
     "settings_rev": 2,
 }
 
@@ -680,6 +682,100 @@ def download_and_restart(url, log):
     )
 
 
+# ---------------------------------------------------------------- reports --
+
+
+class Reporter:
+    """Sends problems to the GitHub repo as issues so they can be fixed without
+    anyone copying logs. One issue per app session; later events become comments.
+    Rate-limited so a bad night can't flood the repo."""
+
+    MIN_GAP = 120  # seconds between posts
+    MAX_POSTS = 15  # per app session
+
+    def __init__(self, get_log_lines, log):
+        self.get_log_lines = get_log_lines
+        self.log = log
+        self.enabled = True
+        self.issue_number = None
+        self.last_post = 0.0
+        self.posts = 0
+        self.pending = []
+        self.lock = threading.Lock()
+
+    @property
+    def available(self):
+        return bool(REPORT_TOKEN)
+
+    def event(self, reason):
+        """Queue a report. Safe to call from any thread."""
+        if not (self.enabled and self.available):
+            return
+        with self.lock:
+            self.pending.append(f"{time.strftime('%H:%M:%S')} {reason}")
+        threading.Thread(target=self._flush, daemon=True).start()
+
+    def _api(self, method, path, body):
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{REPO}{path}",
+            data=json.dumps(body).encode(),
+            method=method,
+            headers={
+                "Authorization": f"Bearer {REPORT_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "HomePodLink",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+
+    def _flush(self, force=False):
+        with self.lock:
+            if not self.pending:
+                return
+            if self.posts >= self.MAX_POSTS:
+                self.pending.clear()
+                return
+            if not force and time.time() - self.last_post < self.MIN_GAP:
+                # try again once the gap has passed
+                threading.Timer(self.MIN_GAP, self._flush).start()
+                return
+            reasons, self.pending = self.pending, []
+            self.last_post = time.time()
+            self.posts += 1
+        lines = self.get_log_lines()[-150:]
+        body = (
+            "**Why:**\n" + "\n".join(f"- {r}" for r in reasons)
+            + f"\n\n**App:** {APP_NAME} {APP_VERSION} build {BUILD_NUMBER} on {platform.platform()}"
+            + "\n\n<details><summary>Log (last 150 lines)</summary>\n\n```\n"
+            + "\n".join(lines)[-60000:]
+            + "\n```\n</details>"
+        )
+        try:
+            if self.issue_number is None:
+                res = self._api("POST", "/issues", {
+                    "title": f"[auto] Build {BUILD_NUMBER}: {reasons[0][9:80]}",
+                    "body": body,
+                })
+                self.issue_number = res.get("number")
+                self.log(f"Report sent to GitHub (issue #{self.issue_number})")
+            else:
+                self._api("POST", f"/issues/{self.issue_number}/comments", {"body": body})
+                self.log(f"Report added to GitHub issue #{self.issue_number}")
+        except Exception as ex:
+            self.log(f"Couldn't send report: {ex!r}")
+
+    def send_now(self, note="Sent manually"):
+        if not self.available:
+            return False
+        with self.lock:
+            self.pending.append(f"{time.strftime('%H:%M:%S')} {note}")
+        threading.Thread(target=self._flush, kwargs={"force": True}, daemon=True).start()
+        return True
+
+
 # ----------------------------------------------------------------------- UI --
 
 RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
@@ -842,6 +938,7 @@ class App:
         self.swap = tk.BooleanVar(value=self.settings["swap_lr"])
         self.rainbow = tk.BooleanVar(value=self.settings["rainbow"])
         self.auto_fix = tk.BooleanVar(value=self.settings.get("auto_fix", True))
+        self.send_reports = tk.BooleanVar(value=self.settings.get("send_reports", True))
         self.proto = tk.StringVar(value=self.settings["protocol"])
         self.show_log = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Looking for speakers...")
@@ -850,11 +947,13 @@ class App:
         self.selected = set(self.settings.get("last_devices", []))
         self._vol_job = None
 
-        root.geometry("420x780")
+        root.geometry("440x820")
         root.minsize(380, 560)
         self.body = None
         self.build()
 
+        self.reporter = Reporter(lambda: list(self.log_lines), self.log)
+        self.reporter.enabled = self.send_reports.get()
         self.backend = Backend(self.log, self.set_status)
         self.backend.auto_fix = self.auto_fix.get()
         self.backend.on_delay_change = lambda v, apply_now=True: self.root.after(
@@ -935,6 +1034,7 @@ class App:
         tc = Card(wrap, th)
         tc.pack(fill="x", pady=(0, 14))
         rows = [("Auto-fix choppy sound", self.auto_fix, self.on_auto_fix),
+                ("Send problem reports to GitHub", self.send_reports, self.on_send_reports),
                 ("Stereo pair (left + right)", self.split, self._render_speakers),
                 ("Swap left and right", self.swap, self._render_speakers),
                 ("Rainbow theme", self.rainbow, self.on_theme)]
@@ -953,10 +1053,11 @@ class App:
         # link row
         links = tk.Frame(wrap, bg=th["bg"])
         links.pack(pady=(0, 6))
-        for text, cmd in (("Rescan", self.on_scan), ("Check for update", self.on_update),
-                          ("GitHub page", self.open_repo), ("Copy log", self.copy_log)):
+        for text, cmd in (("Rescan", self.on_scan), ("Update", self.on_update),
+                          ("GitHub", self.open_repo), ("Copy log", self.copy_log),
+                          ("Report", self.report_now)):
             l = tk.Label(links, text=text, bg=th["bg"], fg=th["accent"], font=(FONT, 10), cursor="hand2")
-            l.pack(side="left", padx=7)
+            l.pack(side="left", padx=8)
             l.bind("<Button-1>", lambda e, c=cmd: c())
 
         # advanced (mode + log), collapsed by default
@@ -1054,6 +1155,19 @@ class App:
         self.settings["auto_fix"] = self.auto_fix.get()
         save_settings(self.settings)
 
+    def on_send_reports(self):
+        self.reporter.enabled = self.send_reports.get()
+        self.settings["send_reports"] = self.send_reports.get()
+        save_settings(self.settings)
+        if self.send_reports.get() and not self.reporter.available:
+            self.set_status("Reports aren't set up in this build yet")
+
+    def report_now(self):
+        if self.reporter.send_now():
+            self.set_status("Sending report to GitHub...")
+        else:
+            self.set_status("Reports aren't set up in this build yet - use Copy log")
+
     def _delay_changed(self, v, apply_now=True):
         self.settings["latency_ms"] = v
         save_settings(self.settings)
@@ -1089,15 +1203,21 @@ class App:
 
         logging.getLogger("pyatv").addHandler(_UIHandler())
 
+    REPORT_TRIGGERS = ("stream error", "Auto-fix:", "couldn't stay connected", "Capture error",
+                       "Update failed", "Scan failed", "dropped - reconnecting")
+
     def log(self, msg):
         line = f"{time.strftime('%H:%M:%S')} {msg}"
         logging.getLogger("homepod_link").info(msg)
         self.logq.put(line)
+        self.log_lines.append(line)
+        reporter = getattr(self, "reporter", None)
+        if reporter and any(t in msg for t in self.REPORT_TRIGGERS) and not msg.startswith("Status:"):
+            reporter.event(msg[:200])
 
     def _drain_log(self):
         while not self.logq.empty():
             line = self.logq.get()
-            self.log_lines.append(line)
             if self.log_box is not None:
                 try:
                     self.log_box.insert("end", line + "\n")
@@ -1245,6 +1365,7 @@ class App:
             swap_lr=self.swap.get(),
             rainbow=self.rainbow.get(),
             auto_fix=self.auto_fix.get(),
+            send_reports=self.send_reports.get(),
             last_devices=[n for n in self.names if n in self.selected] or self.settings.get("last_devices", []),
         )
         save_settings(self.settings)
