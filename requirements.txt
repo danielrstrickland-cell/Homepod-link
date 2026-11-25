@@ -4,3 +4,6 @@ srptools==1.0.1
 soundcard==0.4.6
 numpy
 scipy
+soxr
+moderngl
+pyglet

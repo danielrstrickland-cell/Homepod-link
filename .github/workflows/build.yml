@@ -22,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
       - name: Smoke test imports
-        run: python -c "import pyatv, soundcard, numpy, miniaudio, tkinter; from pyatv.auth.hap_srp import SRPAuthHandler; h=SRPAuthHandler(); h.initialize(); h.step1(3939); print('imports + pairing step ok')"
+        run: python -c "import pyatv, soundcard, numpy, miniaudio, tkinter, soxr, moderngl, pyglet, viz3d; from pyatv.auth.hap_srp import SRPAuthHandler; h=SRPAuthHandler(); h.initialize(); h.step1(3939); print('imports + pairing step ok')"
       - name: Stamp build number
         shell: bash
         run: sed -i "s/^BUILD_NUMBER = 0 /BUILD_NUMBER = ${{ github.run_number }} /" homepod_link.py && grep -n "^BUILD_NUMBER" homepod_link.py
@@ -43,7 +43,7 @@ jobs:
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name HomePodLink
-          --collect-all pyatv --collect-all soundcard --collect-all miniaudio
+          --collect-all pyatv --collect-all soundcard --collect-all miniaudio --collect-all soxr --collect-all moderngl --collect-all glcontext --collect-all pyglet --hidden-import viz3d
           homepod_link.py
       - name: Checksum
         id: sum

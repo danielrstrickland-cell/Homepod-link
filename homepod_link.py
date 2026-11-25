@@ -29,7 +29,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "1.4.0"
+APP_VERSION = "2.0.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -60,6 +60,8 @@ DEFAULTS = {
     "auto_sim": True,
     "resume_after_update": False,
     "viz_height": 110,
+    "viz3d_mode": 0,
+    "viz3d_pause_sim": True,
     "viz_style": "Bars",
     "viz_colors": "Theme",
     "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
@@ -354,8 +356,13 @@ class LiveBuffer:
             data = np.column_stack([data[:, 0], data[:, 0]])
         elif self.channel == "right":
             data = np.column_stack([data[:, 1], data[:, 1]])
-        # AirPlay wants big-endian 16-bit PCM
-        return (np.clip(data, -1.0, 1.0) * 32767).astype(">i2").tobytes()
+        # AirPlay wants big-endian 16-bit PCM. TPDF dither (mastering standard) instead
+        # of truncation, so quiet passages don't pick up quantisation distortion.
+        # True digital silence stays silent.
+        x = np.clip(data, -1.0, 1.0) * 32767.0
+        if got:
+            x += np.random.random(x.shape) - np.random.random(x.shape)
+        return np.clip(np.round(x), -32768, 32767).astype(">i2").tobytes()
 
 
 class LiveSource(AudioSource):
@@ -414,6 +421,50 @@ def _counting_retx(self, request, addr):
 
 _sc.ControlClient._retransmit_lost_packets = _counting_retx
 
+# ------------------------------------------------------------- real-time --
+
+
+def win_process_tuning(log):
+    """1 ms timer (Windows otherwise wakes us every 15.6 ms, so packets go out in
+    bursts), high process priority, and fewer/shorter garbage-collection pauses."""
+    import gc
+
+    gc.freeze()  # everything created at startup is never scanned again
+    gc.set_threshold(20000, 30, 100)
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)  # HIGH
+        log("Real-time: 1 ms timer, high priority")
+    except Exception as ex:
+        log(f"Real-time tuning unavailable: {ex!r}")
+
+
+def mmcss_pro_audio(label, log=None):
+    """Register the calling thread with Windows' multimedia scheduler ("Pro Audio"),
+    the same class DAWs use, so a busy game can't starve it."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        avrt = ctypes.windll.avrt
+        avrt.AvSetMmThreadCharacteristicsW.restype = wintypes.HANDLE
+        task = wintypes.DWORD(0)
+        h = avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task))
+        if h:
+            avrt.AvSetMmThreadPriority(h, 1)  # AVRT_PRIORITY_HIGH
+            if log:
+                log(f"Real-time: {label} thread on Pro Audio scheduling")
+    except Exception as ex:
+        if log:
+            log(f"Pro Audio scheduling unavailable for {label}: {ex!r}")
+
+
 # ------------------------------------------------------------------ capture --
 
 
@@ -430,6 +481,7 @@ class LoopbackCapture(threading.Thread):
         self.buffers = []
         self.device_name = "?"
         self.source = source  # "" = default output (everything); else a device name
+        self.capture_rate = SAMPLE_RATE
 
     def set_source(self, name):
         if name != self.source:
@@ -458,11 +510,12 @@ class LoopbackCapture(threading.Thread):
     def stop(self):
         self._stop_evt.set()
 
-    def _fan_out(self, data):
-        t = time.monotonic()
+    def _fan_out(self, data, lag=0.0):
+        t = time.monotonic() - lag  # resampler holds ~10 ms; keep timestamps exact
         TIMELINE.push(EQ.process(data.astype(np.float32)), t)
 
     def run(self):
+        mmcss_pro_audio("capture", self.log)
         try:
             import soundcard as sc  # imported here so errors land in the log
         except Exception as ex:
@@ -474,9 +527,20 @@ class LoopbackCapture(threading.Thread):
                 mic, label = self._open(sc)
                 following_default = not self.source or label == sc.default_speaker().name
                 self.device_name = sc.default_speaker().name
-                self.log(f"Capturing from: {label}")
-                block = 441  # 10 ms blocks: low latency without capture dropouts
-                with mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS, blocksize=block) as rec:
+                # Capture at the device's usual native rate and convert with a studio-grade
+                # resampler (soxr VHQ) instead of Windows' basic built-in conversion.
+                try:
+                    import soxr
+
+                    cap_rate = 48000
+                    rs = soxr.ResampleStream(cap_rate, SAMPLE_RATE, CHANNELS, dtype="float32", quality="VHQ")
+                except Exception:
+                    cap_rate, rs = SAMPLE_RATE, None
+                self.capture_rate = cap_rate
+                self.log(f"Capturing from: {label} at {cap_rate} Hz"
+                         + (" -> soxr VHQ -> 44100 Hz" if rs else ""))
+                block = cap_rate // 100  # 10 ms blocks: low latency without capture dropouts
+                with mic.recorder(samplerate=cap_rate, channels=CHANNELS, blocksize=block) as rec:
                     checks = 0
                     while not self._stop_evt.is_set():
                         data = rec.record(numframes=block)
@@ -486,7 +550,11 @@ class LoopbackCapture(threading.Thread):
                             data = np.repeat(data, 2, axis=1)
                         elif data.shape[1] > 2:
                             data = data[:, :2]
-                        self._fan_out(data)
+                        if rs is not None:
+                            data = rs.resample_chunk(np.ascontiguousarray(data, dtype=np.float32))
+                            if not len(data):
+                                continue
+                        self._fan_out(data, lag=0.010 if rs is not None else 0.0)
                         checks += 1
                         if self._restart.is_set():
                             self.log("Audio source changed, restarting capture")
@@ -789,6 +857,7 @@ class Backend:
         self.source = ""
 
     def _run_loop(self):
+        mmcss_pro_audio("network sender", self.log)
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
@@ -1208,6 +1277,9 @@ RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
 VIZ_STYLES = ("Bars", "Mirror", "Wave", "Dots", "Scope")
 VIZ_PALETTES = {
     "Theme": None,  # accent colour, or rainbow in the rainbow theme
+    "Nightclub": ["#00F0FF", "#7B2FFF", "#FF00C8", "#FF2E63"],
+    "Turbo": ["#FFD60A", "#FF8C00", "#FF3B00", "#D00000"],
+    "Hyperdrive": ["#00F5FF", "#00A2FF", "#4D4DFF", "#B400FF"],
     "Rainbow": RAINBOW,
     "Sunset": ["#FF5F6D", "#FF8A5B", "#FFC371", "#F857A6", "#B24592"],
     "Ocean": ["#00C6FB", "#0099F7", "#005BEA", "#2E3192"],
@@ -1400,10 +1472,20 @@ class App:
         self.body = None
         self.build()
 
+        win_process_tuning(self.log)
         self.reporter = Reporter(lambda: list(self.log_lines), self.log)
         self.reporter.enabled = self.send_reports.get()
         self.backend = Backend(self.log, self.set_status)
         self.backend.auto_fix = self.auto_fix.get()
+        try:
+            import viz3d
+
+            self.viz3d = viz3d.VizBridge(
+                TIMELINE, SAMPLE_RATE, self.log,
+                delay_s=lambda: (LATENCY_MS["value"] / 1000 + Timeline.READ_DELAY) if self.backend.sessions else 0.0)
+        except Exception as ex:
+            self.viz3d = None
+            self.log(f"3D visualizer unavailable: {ex!r}")
         if self.settings.get("source") is None:
             line1 = find_line1(list_sources())
             self.settings["source"] = line1
@@ -1483,6 +1565,16 @@ class App:
         self.spk_card = Card(wrap, th)
         self.spk_card.pack(fill="x", pady=(0, 14))
         self._render_speakers()
+
+        # stream health (real numbers)
+        if getattr(self, "backend", None) and self.backend.sessions:
+            lbl(wrap, "STREAM HEALTH", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
+            hc = Card(wrap, th)
+            hc.pack(fill="x", pady=(0, 14))
+            self.health_lbl = tk.Label(hc.inner, text="", bg=th["card"], fg=th["sub"], justify="left",
+                                       font=("Consolas", 9))
+            self.health_lbl.pack(anchor="w", padx=12, pady=8)
+            self._health_tick(self._ui_gen)
 
         # audio source
         lbl(wrap, "AUDIO SOURCE", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
@@ -1566,11 +1658,51 @@ class App:
         else:
             self.log_box = None
 
+    def _health_tick(self, gen):
+        if gen != self._ui_gen or self.page != "main":
+            return
+        rows = []
+        cap = self.backend.capture
+        for sess in list(self.backend.sessions.values()):
+            ip = str(self.backend.devices[sess.name].address) if sess.name in self.backend.devices else ""
+            lost = LOST.get(ip, 0)
+            state = "playing" if sess.playing else "connecting"
+            rows.append(f"{sess.name[:18]:18s} {state:10s} lost {lost:5d}  late {sess.buf.underruns:4d}  resync {sess.buf.dropped:3d}")
+        rows.append(f"delay {LATENCY_MS['value']} ms + {Timeline.READ_DELAY * 1000:.0f} ms read   "
+                    f"capture {getattr(cap, 'capture_rate', SAMPLE_RATE) if cap else '-'} Hz -> 44100 Hz")
+        try:
+            self.health_lbl.config(text="\n".join(rows))
+        except tk.TclError:
+            return
+        self.root.after(1000, lambda: self._health_tick(gen))
+
     def _go(self, page):
         self.page = page
         self.build()
 
     def _build_sound(self, wrap, th, lbl, rb):
+        # 3D visualizer (GPU, own window)
+        if getattr(self, "viz3d", None):
+            lbl(wrap, "3D VISUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
+            c3 = Card(wrap, th)
+            c3.pack(fill="x", pady=(0, 14))
+            mrow = tk.Frame(c3.inner, bg=th["card"])
+            mrow.pack(fill="x", padx=10, pady=(8, 4))
+            cur = int(self.settings.get("viz3d_mode", 0))
+            for i, name in enumerate(("Waterfall", "Bars", "Ring", "Highway")):
+                sel = i == cur
+                b = tk.Label(mrow, text=name, bg=th["accent"] if sel else th["off"], fg="white" if sel else th["text"],
+                             font=(FONT, 9), padx=6, pady=3, cursor="hand2")
+                b.pack(side="left", padx=2, fill="x", expand=True)
+                b.bind("<Button-1>", lambda e, i=i: self._viz3d_mode(i))
+            prow3 = tk.Frame(c3.inner, bg=th["card"])
+            prow3.pack(fill="x", padx=12, pady=4)
+            lbl(prow3, "Pause while a sim runs", 10).pack(side="left")
+            self.viz3d_pause = getattr(self, "viz3d_pause", tk.BooleanVar(value=self.settings.get("viz3d_pause_sim", True)))
+            Toggle(prow3, self.viz3d_pause, th, command=self._viz3d_sync).pack(side="right")
+            BigButton(wrap if False else c3.inner, "Close 3D visualizer" if self.viz3d.is_open() else "Open 3D visualizer",
+                      th, self._viz3d_toggle, rainbow=rb).pack(fill="x", padx=10, pady=(4, 10))
+
         # visualizer
         lbl(wrap, "VISUALIZER", 9, "sub", bg="bg").pack(anchor="w", padx=4, pady=(0, 4))
         vc = Card(wrap, th)
@@ -1869,6 +2001,39 @@ class App:
         cost_ms = (time.perf_counter() - t_start) * 1000
         self.root.after(int(max(33, cost_ms * 4)), lambda: self._viz_tick(gen))
 
+    def _viz3d_palette(self):
+        import viz3d
+
+        name = self.settings.get("viz_colors", "Theme")
+        if name == "Theme":
+            return 1 if self.rainbow.get() else 0
+        return viz3d.PALETTE_NAMES.index(name) if name in viz3d.PALETTE_NAMES else 0
+
+    def _viz3d_sync(self):
+        if not getattr(self, "viz3d", None):
+            return
+        pause = bool(self._sim_active) and self.settings.get("viz3d_pause_sim", True)
+        if hasattr(self, "viz3d_pause"):
+            self.settings["viz3d_pause_sim"] = self.viz3d_pause.get()
+            pause = bool(self._sim_active) and self.viz3d_pause.get()
+            save_settings(self.settings)
+        self.viz3d.set(palette_idx=self._viz3d_palette(), mode=int(self.settings.get("viz3d_mode", 0)), paused=pause)
+
+    def _viz3d_toggle(self):
+        if self.viz3d.is_open():
+            self.viz3d.data[5] = 1  # ask the window to close
+            self.root.after(400, self.build)
+        else:
+            self.viz3d.open(self._viz3d_palette(), int(self.settings.get("viz3d_mode", 0)))
+            self._viz3d_sync()
+            self.root.after(800, self.build)
+
+    def _viz3d_mode(self, i):
+        self.settings["viz3d_mode"] = i
+        save_settings(self.settings)
+        self._viz3d_sync()
+        self.build()
+
     def _viz_resize(self, e):
         y0, h0 = getattr(self, "_viz_drag", (e.y_root, self.viz_h))
         self.viz_h = int(max(40, min(400, h0 + (e.y_root - y0))))
@@ -1877,6 +2042,7 @@ class App:
     def _viz_set(self, key, value):
         self.settings[key] = value
         save_settings(self.settings)
+        self._viz3d_sync()
         self.build()
 
     def _sim_watch(self):
@@ -1899,6 +2065,7 @@ class App:
             self.smart_eq.set(False)
             self.settings["eq_preset"] = "Sim racing"
             self.set_status(f"{name} detected - Sim racing sound on")
+            self._viz3d_sync()
             self.log(f"Sim racing mode: {name} started")
             self.build()
         elif not name and self._sim_active:
@@ -1912,6 +2079,7 @@ class App:
             self.settings["eq_preset"] = preset
             self._sim_active = self._sim_saved = None
             self.set_status("Game closed - your normal sound is back")
+            self._viz3d_sync()
             self.build()
 
     def _stripe(self, cv):
@@ -1987,6 +2155,15 @@ class App:
 
     def on_auto_fix(self):
         self.backend.auto_fix = self.auto_fix.get()
+        try:
+            import viz3d
+
+            self.viz3d = viz3d.VizBridge(
+                TIMELINE, SAMPLE_RATE, self.log,
+                delay_s=lambda: (LATENCY_MS["value"] / 1000 + Timeline.READ_DELAY) if self.backend.sessions else 0.0)
+        except Exception as ex:
+            self.viz3d = None
+            self.log(f"3D visualizer unavailable: {ex!r}")
         if self.settings.get("source") is None:
             line1 = find_line1(list_sources())
             self.settings["source"] = line1
@@ -2106,6 +2283,10 @@ class App:
                 self.play_btn.set_text(self._play_text())
             except tk.TclError:
                 pass
+            want = bool(self.backend.sessions) if getattr(self, "backend", None) else False
+            if want != getattr(self, "_health_shown", False) and self.page == "main":
+                self._health_shown = want
+                self.build()
 
         self.root.after(0, apply)
         self.log(f"Status: {text}")
@@ -2271,10 +2452,17 @@ class App:
             self.backend.submit(self.backend.disconnect(quiet=True)).result(timeout=3)
         except Exception:
             pass
+        if getattr(self, "viz3d", None):
+            self.viz3d.close()
         self.root.destroy()
 
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--viz":
+        import viz3d
+
+        viz3d.run_window(sys.argv[2])
+        return
     if sys.platform == "win32":
         try:
             import ctypes

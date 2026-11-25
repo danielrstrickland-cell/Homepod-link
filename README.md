@@ -30,6 +30,25 @@ If it won't connect, hit **Copy log** and send the log.
 
 The full debug log is saved at `%APPDATA%\HomePodLink\homepod_link.log`.
 
+## 3D visualizer
+
+GPU-rendered (OpenGL 3.3) in its own window, as a separate process, so it can never disturb the audio:
+- **Modes:** 3D Waterfall, 3D Bars, 3D Ring and **Neon Highway** (drive between walls of light built from the music).
+- **Look:** glossy lit bars, floor reflections, fog, HDR bloom, beat-reactive glow and camera, and sparks or speed streaks on kicks.
+- **Controls:** drag to spin, scroll to zoom, double-click to reset, keys 1-4 switch modes, F for full screen.
+- **Colors:** adds Nightclub, Turbo and Hyperdrive.
+- **Accurate, not decorative:** a calibrated multi-resolution analyzer (16k/8k/4k/1k FFT, Hann, ENBW-corrected, full-scale sine = 0 dBFS, 64 log bands). It's delayed by the stream latency, so the picture matches what the HomePods are playing.
+- **Pauses itself while a racing sim runs** (switchable), so it never costs frames on track.
+
+## Audio engine
+
+- **1 ms Windows timer:** smooth packet pacing instead of 15.6 ms bursts.
+- **Pro Audio scheduling:** capture and network threads use Windows MMCSS "Pro Audio", and the process runs at high priority.
+- **Studio resampling:** captures at 48 kHz and converts with soxr VHQ (artifacts below -100 dB) to AirPlay's 44.1 kHz.
+- **TPDF dither:** used on the conversion to 16-bit; true silence stays silent.
+- **Stream clock fixes:** the clock is re-anchored after setup, sync packets carry the real clock, and audio is selected per packet by its exact play time.
+- **Stream health panel:** shows lost packets, late reads, resyncs, delay and capture rate.
+
 ## Sound tab
 
 - **Visualizer:** live view of what's being sent. Styles: Bars (with peak caps), Mirror, Wave, Dots and Scope (the real waveform). Colors: Theme, Rainbow, Sunset, Ocean, Neon and Mono. Drag the handle under it to resize. Tap the visualizer to cycle styles.
