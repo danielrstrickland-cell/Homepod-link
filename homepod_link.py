@@ -19,6 +19,8 @@ import tkinter as tk
 from tkinter import ttk
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find viz3d.py next to this file
 import pyatv
 import pyatv.protocols.raop as raop_mod
 from pyatv.const import Protocol
@@ -29,7 +31,7 @@ from pyatv.storage.memory_storage import MemoryStorage
 from pyatv.support.metadata import MediaMetadata
 
 APP_NAME = "HomePod Link"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 BUILD_NUMBER = 0  # stamped by the GitHub build
 REPO = "danielrstrickland-cell/Homepod-link"
 REPORT_TOKEN = ""  # stamped by the GitHub build from the REPORT_TOKEN secret (issues-only key)
@@ -62,6 +64,10 @@ DEFAULTS = {
     "viz_height": 110,
     "viz3d_mode": 0,
     "viz3d_pause_sim": True,
+    "viz3d_quality": 3,  # 0 Low, 1 Medium, 2 High, 3 Ultra
+    "viz3d_custom": {},  # per mode: {"0": {"sens": 1.0, ...}}
+    "viz2d_sens": 100,
+    "last_seen_version": "",
     "viz_style": "Bars",
     "viz_colors": "Theme",
     "source": None,  # None = not chosen yet (auto-pick Line 1 if present)
@@ -1271,6 +1277,33 @@ class Reporter:
         return True
 
 
+# ------------------------------------------------------------- what's new --
+
+# Shown once, the first time each new version is opened.
+CHANGELOG = [
+    ("2.1.0", [
+        ("Customize each visualizer", "Sensitivity, bar height and width, speed, glow, beat punch, auto-rotate and reflections. Saved separately for each 3D mode."),
+        ("3D quality levels", "Low, Medium, High or Ultra on the Sound tab. Ultra: twice the waterfall detail, 8x smoothing, full-resolution glow, up to 8,000 sparks. Low: 30 fps, no glow, for busy moments."),
+        ("Audio comes first", "The 3D window runs at below-normal priority, so it can never take time from the audio stream."),
+        ("Street Tuner theme", "Neon green and blue. The Neon Highway drives faster, with more speed streaks on every kick."),
+        ("What's new", "This page. It shows once after each update."),
+    ]),
+    ("2.0.0", [
+        ("3D visualizer", "Waterfall, Bars, Ring and Neon Highway, rendered on the graphics card. Drag to spin, scroll to zoom, F for full screen."),
+        ("Real measurements", "A calibrated spectrum analyzer, synced to what the HomePods are actually playing."),
+        ("Smoother audio engine", "1 ms timer, Pro Audio priority, studio-grade resampling and dither for cleaner, steadier sound."),
+        ("Stream health", "Live lost and late packet counts on the Speakers tab."),
+    ]),
+]
+
+
+def _ver(v):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except Exception:
+        return (0,)
+
+
 # ----------------------------------------------------------------------- UI --
 
 RAINBOW = ["#E40303", "#FF8C00", "#FFED00", "#008026", "#004DFF", "#750787"]
@@ -1280,6 +1313,7 @@ VIZ_PALETTES = {
     "Nightclub": ["#00F0FF", "#7B2FFF", "#FF00C8", "#FF2E63"],
     "Turbo": ["#FFD60A", "#FF8C00", "#FF3B00", "#D00000"],
     "Hyperdrive": ["#00F5FF", "#00A2FF", "#4D4DFF", "#B400FF"],
+    "Street Tuner": ["#39FF14", "#00FF9C", "#00E0FF", "#0A6CFF"],
     "Rainbow": RAINBOW,
     "Sunset": ["#FF5F6D", "#FF8A5B", "#FFC371", "#F857A6", "#B24592"],
     "Ocean": ["#00C6FB", "#0099F7", "#005BEA", "#2E3192"],
@@ -1505,11 +1539,16 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.on_scan()
         self.root.after(4000, lambda: self.on_update(quiet=True))
+        self.root.after(1200, self._whats_new)
 
     # ------------------------------------------------------------- layout --
     def build(self):
         """(Re)build the whole window. Called again when the theme changes."""
         if self.body is not None:
+            try:
+                self._scroll_keep = self._scroll_cv.yview()[0]
+            except Exception:
+                self._scroll_keep = None
             self.body.destroy()
         self.log_box = None
         self._ui_gen = getattr(self, "_ui_gen", 0) + 1  # stops loops from older layouts
@@ -1529,8 +1568,30 @@ class App:
             stripe.pack(fill="x")
             stripe.bind("<Configure>", lambda e: self._stripe(stripe))
 
-        wrap = tk.Frame(body, bg=th["bg"])
-        wrap.pack(fill="both", expand=True, padx=16, pady=(12, 12))
+        # scrollable page (mouse wheel), so long tabs never get cut off
+        sc_cv = tk.Canvas(body, bg=th["bg"], highlightthickness=0, bd=0)
+        sc_cv.pack(fill="both", expand=True)
+        wrap = tk.Frame(sc_cv, bg=th["bg"])
+        win_id = sc_cv.create_window(16, 12, window=wrap, anchor="nw")
+
+        def _fit(_e=None):
+            sc_cv.itemconfigure(win_id, width=max(100, sc_cv.winfo_width() - 32))
+            sc_cv.configure(scrollregion=(0, 0, sc_cv.winfo_width(), wrap.winfo_reqheight() + 24))
+
+        sc_cv.bind("<Configure>", _fit)
+        wrap.bind("<Configure>", _fit)
+
+        def _wheel(e):
+            if wrap.winfo_reqheight() + 24 > sc_cv.winfo_height():
+                sc_cv.yview_scroll(int(-e.delta / 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+
+        self.root.bind_all("<MouseWheel>", _wheel)
+        self.root.bind_all("<Button-4>", _wheel)
+        self.root.bind_all("<Button-5>", _wheel)
+        if getattr(self, "_scroll_keep", None) is not None and self.page == getattr(self, "_scroll_page", None):
+            self.root.after(30, lambda y=self._scroll_keep: sc_cv.yview_moveto(y))
+        self._scroll_cv = sc_cv
+        self._scroll_page = self.page
 
         def lbl(parent, text, size=11, color="text", bold=False, bg="card", **kw):
             return tk.Label(parent, text=text, bg=th[bg], fg=th[color],
@@ -1676,6 +1737,44 @@ class App:
             return
         self.root.after(1000, lambda: self._health_tick(gen))
 
+    def _whats_new(self):
+        seen = self.settings.get("last_seen_version", "")
+        new = [(v, items) for v, items in CHANGELOG if _ver(v) > _ver(seen)] if seen else CHANGELOG[:2]
+        self.settings["last_seen_version"] = APP_VERSION
+        save_settings(self.settings)
+        if not new:
+            return
+        th = self.th
+        top = tk.Toplevel(self.root, bg=th["bg"])
+        top.title("What's new")
+        top.transient(self.root)
+        top.resizable(False, False)
+        x = self.root.winfo_rootx() + 20
+        y = self.root.winfo_rooty() + 60
+        top.geometry(f"400x560+{x}+{y}")
+        if self.rainbow.get():
+            st = tk.Canvas(top, height=6, highlightthickness=0, bd=0)
+            st.pack(fill="x")
+            st.bind("<Configure>", lambda e: self._stripe(st))
+        tk.Label(top, text="What's new", bg=th["bg"], fg=th["text"], font=(FONT_DISPLAY, 20, "bold")).pack(
+            anchor="w", padx=18, pady=(14, 0))
+        tk.Label(top, text=f"HomePod Link {APP_VERSION} \u00b7 build {BUILD_NUMBER}", bg=th["bg"], fg=th["sub"],
+                 font=(FONT, 10)).pack(anchor="w", padx=18, pady=(0, 10))
+        body = tk.Frame(top, bg=th["bg"])
+        body.pack(fill="both", expand=True, padx=14)
+        for v, items in new:
+            if len(new) > 1:
+                tk.Label(body, text=f"VERSION {v}", bg=th["bg"], fg=th["sub"], font=(FONT, 8)).pack(anchor="w", padx=4, pady=(4, 2))
+            card = Card(body, th)
+            card.pack(fill="x", pady=(0, 10))
+            for title, text in items:
+                tk.Label(card.inner, text=title, bg=th["card"], fg=th["accent"], font=(FONT, 11, "bold")).pack(
+                    anchor="w", padx=12, pady=(8, 0))
+                tk.Label(card.inner, text=text, bg=th["card"], fg=th["text"], font=(FONT, 9), wraplength=340,
+                         justify="left").pack(anchor="w", padx=12, pady=(0, 6))
+        BigButton(top, "Continue", th, top.destroy, rainbow=self.rainbow.get()).pack(fill="x", padx=16, pady=14)
+        top.grab_set()
+
     def _go(self, page):
         self.page = page
         self.build()
@@ -1700,6 +1799,21 @@ class App:
             lbl(prow3, "Pause while a sim runs", 10).pack(side="left")
             self.viz3d_pause = getattr(self, "viz3d_pause", tk.BooleanVar(value=self.settings.get("viz3d_pause_sim", True)))
             Toggle(prow3, self.viz3d_pause, th, command=self._viz3d_sync).pack(side="right")
+            urow = tk.Frame(c3.inner, bg=th["card"])
+            urow.pack(fill="x", padx=12, pady=(4, 0))
+            lbl(urow, "Quality", 10).pack(side="left")
+            lbl(urow, "(applies when opened)", 8, "sub").pack(side="left", padx=6)
+            qrow = tk.Frame(c3.inner, bg=th["card"])
+            qrow.pack(fill="x", padx=10, pady=(2, 4))
+            curq = int(self.settings.get("viz3d_quality", 3))
+            for i, name in enumerate(("Low", "Medium", "High", "Ultra")):
+                sel = i == curq
+                b = tk.Label(qrow, text=name, bg=th["accent"] if sel else th["off"], fg="white" if sel else th["text"],
+                             font=(FONT, 9), padx=6, pady=3, cursor="hand2")
+                b.pack(side="left", padx=2, fill="x", expand=True)
+                b.bind("<Button-1>", lambda e, i=i: (self.settings.__setitem__("viz3d_quality", i),
+                                                     save_settings(self.settings), self.build()))
+            self._viz3d_customize(c3.inner, th, lbl)
             BigButton(wrap if False else c3.inner, "Close 3D visualizer" if self.viz3d.is_open() else "Open 3D visualizer",
                       th, self._viz3d_toggle, rainbow=rb).pack(fill="x", padx=10, pady=(4, 10))
 
@@ -1736,7 +1850,17 @@ class App:
                 b.bind("<Button-1>", lambda e, o=o: self._viz_set(key, o))
 
         chips(vc.inner, "viz_style", VIZ_STYLES, self.settings.get("viz_style", "Bars"))
-        chips(vc.inner, "viz_colors", list(VIZ_PALETTES), self.settings.get("viz_colors", "Theme"))
+        chips(vc.inner, "viz_colors", list(VIZ_PALETTES)[:6], self.settings.get("viz_colors", "Theme"))
+        chips(vc.inner, "viz_colors", list(VIZ_PALETTES)[6:], self.settings.get("viz_colors", "Theme"))
+        srow = tk.Frame(vc.inner, bg=th["card"])
+        srow.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(srow, text="Sensitivity", bg=th["card"], fg=th["text"], font=(FONT, 9), width=11, anchor="w").pack(side="left")
+        sv = tk.IntVar(value=int(self.settings.get("viz2d_sens", 100)))
+        svl = tk.Label(srow, text=f"{sv.get()}%", bg=th["card"], fg=th["text"], font=(FONT, 9, "bold"), width=5)
+        svl.pack(side="right")
+        Slider(srow, sv, 25, 300, th, step=5,
+               command=lambda v: (svl.config(text=f"{v}%"), self.settings.__setitem__("viz2d_sens", v))).pack(
+            side="left", fill="x", expand=True)
         self._viz_tick(self._ui_gen)
 
         # equalizer
@@ -1930,7 +2054,8 @@ class App:
         lv = np.array([spec[(fr >= lo) & (fr < hi)].mean() if np.any((fr >= lo) & (fr < hi))
                        else np.interp(np.sqrt(lo * hi), fr, spec)  # bass bands narrower than an FFT bin
                        for lo, hi in zip(edges[:-1], edges[1:])])
-        lv = np.clip((20 * np.log10(lv + 1e-9) + 10) / 50, 0, 1)
+        shift = np.log2(max(self.settings.get("viz2d_sens", 100), 5) / 100) * 0.15
+        lv = np.clip((20 * np.log10(lv + 1e-9) + 10) / 50 + shift, 0, 1)
         self._viz_levels = np.maximum(lv, self._viz_levels * 0.85)  # fast attack, smooth fall
         self._viz_peaks = np.maximum(self._viz_levels, self._viz_peaks - 0.015)
         h = self.viz_h
@@ -2001,6 +2126,70 @@ class App:
         cost_ms = (time.perf_counter() - t_start) * 1000
         self.root.after(int(max(33, cost_ms * 4)), lambda: self._viz_tick(gen))
 
+    CUSTOM_ROWS = [  # key, label, min %, max %, step
+        ("sens", "Sensitivity", 25, 300, 5),
+        ("height", "Bar height", 50, 200, 5),
+        ("width", "Bar width", 50, 140, 5),
+        ("speed", "Speed", 30, 300, 5),
+        ("glow", "Glow", 0, 200, 5),
+        ("beat", "Beat punch", 0, 200, 5),
+    ]
+
+    def _custom_for(self, mode):
+        import viz3d
+
+        allc = self.settings.setdefault("viz3d_custom", {})
+        return {**viz3d.CUSTOM_DEFAULT, **allc.get(str(mode), {})}
+
+    def _viz3d_customize(self, parent, th, lbl):
+        mode = int(self.settings.get("viz3d_mode", 0))
+        open_ = getattr(self, "_cust_open", False)
+        names = ("Waterfall", "Bars", "Ring", "Highway")
+        head = tk.Label(parent, text=("Customize " + names[mode] + (" \u25b4" if open_ else " \u25be")),
+                        bg=th["card"], fg=th["accent"], font=(FONT, 10), cursor="hand2")
+        head.pack(anchor="w", padx=12, pady=(4, 2))
+        head.bind("<Button-1>", lambda e: (setattr(self, "_cust_open", not open_), self.build()))
+        if not open_:
+            return
+        cfg = self._custom_for(mode)
+        box = tk.Frame(parent, bg=th["card"])
+        box.pack(fill="x", padx=6)
+        self._cust_vars = {}
+        for key, label, lo, hi, step in self.CUSTOM_ROWS:
+            row = tk.Frame(box, bg=th["card"])
+            row.pack(fill="x", padx=6)
+            var = tk.IntVar(value=int(round(cfg[key] * 100)))
+            val = tk.Label(row, text=f"{var.get()}%", bg=th["card"], fg=th["text"], font=(FONT, 9, "bold"), width=5)
+            tk.Label(row, text=label, bg=th["card"], fg=th["text"], font=(FONT, 9), width=11, anchor="w").pack(side="left")
+            val.pack(side="right")
+            Slider(row, var, lo, hi, th, step=step,
+                   command=lambda v, k=key, l=val: (l.config(text=f"{v}%"), self._custom_set(k, v / 100))).pack(
+                side="left", fill="x", expand=True)
+        for key, label in (("spin", "Auto-rotate"), ("reflect", "Floor reflections")):
+            row = tk.Frame(box, bg=th["card"])
+            row.pack(fill="x", padx=6, pady=2)
+            tk.Label(row, text=label, bg=th["card"], fg=th["text"], font=(FONT, 9)).pack(side="left")
+            bv = tk.BooleanVar(value=cfg[key] > 0.5)
+            Toggle(row, bv, th, command=lambda k=key, b=bv: self._custom_set(k, 1.0 if b.get() else 0.0)).pack(side="right")
+        rst = tk.Label(box, text="Reset to defaults", bg=th["card"], fg=th["accent"], font=(FONT, 9), cursor="hand2")
+        rst.pack(anchor="e", padx=8, pady=(2, 6))
+        rst.bind("<Button-1>", lambda e: self._custom_reset(mode))
+
+    def _custom_set(self, key, value):
+        mode = str(int(self.settings.get("viz3d_mode", 0)))
+        allc = self.settings.setdefault("viz3d_custom", {})
+        allc.setdefault(mode, {})[key] = float(value)
+        self._viz3d_sync()
+        if self._eq_save_job:
+            self.root.after_cancel(self._eq_save_job)
+        self._eq_save_job = self.root.after(500, lambda: save_settings(self.settings))
+
+    def _custom_reset(self, mode):
+        self.settings.setdefault("viz3d_custom", {}).pop(str(mode), None)
+        save_settings(self.settings)
+        self._viz3d_sync()
+        self.build()
+
     def _viz3d_palette(self):
         import viz3d
 
@@ -2017,14 +2206,17 @@ class App:
             self.settings["viz3d_pause_sim"] = self.viz3d_pause.get()
             pause = bool(self._sim_active) and self.viz3d_pause.get()
             save_settings(self.settings)
-        self.viz3d.set(palette_idx=self._viz3d_palette(), mode=int(self.settings.get("viz3d_mode", 0)), paused=pause)
+        mode = int(self.settings.get("viz3d_mode", 0))
+        self.viz3d.set(palette_idx=self._viz3d_palette(), mode=mode, paused=pause)
+        self.viz3d.set_custom(self._custom_for(mode))
 
     def _viz3d_toggle(self):
         if self.viz3d.is_open():
             self.viz3d.data[5] = 1  # ask the window to close
             self.root.after(400, self.build)
         else:
-            self.viz3d.open(self._viz3d_palette(), int(self.settings.get("viz3d_mode", 0)))
+            self.viz3d.open(self._viz3d_palette(), int(self.settings.get("viz3d_mode", 0)),
+                            quality=int(self.settings.get("viz3d_quality", 3)))
             self._viz3d_sync()
             self.root.after(800, self.build)
 

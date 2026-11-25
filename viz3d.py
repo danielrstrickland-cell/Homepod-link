@@ -9,8 +9,10 @@ The main app writes the live spectrum into shared memory; this process only read
 Shared memory layout (float32):
   [0] sequence counter     [1] beat/bass energy (unused, computed here)
   [2] palette index        [3] paused (1 = pause, e.g. while a sim runs)
-  [4] mode (0 waterfall, 1 bars, 2 ring)   [5] quit flag
-  [8:8+BANDS] band levels 0..1
+  [4] mode (0 waterfall, 1 bars, 2 ring, 3 highway)   [5] quit flag
+  [6] quality level (0 Low, 1 Medium, 2 High, 3 Ultra)
+  [8:16] customisation (CUSTOM_KEYS)
+  [16:16+BANDS] band levels 0..1
 """
 
 import math
@@ -19,8 +21,20 @@ import time
 import numpy as np
 
 BANDS = 64
-SHM_FLOATS = 8 + BANDS
-HIST = 64  # waterfall rows
+HDR = 16  # header floats; bands start here
+SHM_FLOATS = HDR + BANDS
+# per-mode customisation, written by the app into slots 8..15
+CUSTOM_KEYS = ["sens", "height", "speed", "glow", "beat", "width", "spin", "reflect"]
+CUSTOM_DEFAULT = {"sens": 1.0, "height": 1.0, "speed": 1.0, "glow": 1.0, "beat": 1.0,
+                  "width": 1.0, "spin": 1.0, "reflect": 1.0}
+HIST = 64  # reference waterfall depth (rows at High)
+# rows, MSAA samples, bloom divisors (None = off), max sparks, fps cap (0 = monitor refresh)
+QUALITY = {
+    0: dict(name="Low", rows=32, samples=0, bloom=None, sparks=800, fps=30),
+    1: dict(name="Medium", rows=48, samples=2, bloom=(4, 8), sparks=2000, fps=60),
+    2: dict(name="High", rows=64, samples=4, bloom=(2, 4), sparks=3500, fps=0),
+    3: dict(name="Ultra", rows=128, samples=8, bloom=(1, 2), sparks=8000, fps=0),
+}
 
 PALETTES = [
     # Theme (Apple blue -> purple), Rainbow, Sunset, Ocean, Neon, Mono
@@ -33,8 +47,10 @@ PALETTES = [
     ["#00F0FF", "#7B2FFF", "#FF00C8", "#FF2E63"],   # Nightclub
     ["#FFD60A", "#FF8C00", "#FF3B00", "#D00000"],   # Turbo
     ["#00F5FF", "#00A2FF", "#4D4DFF", "#B400FF"],   # Hyperdrive
+    ["#39FF14", "#00FF9C", "#00E0FF", "#0A6CFF"],   # Street Tuner
 ]
-PALETTE_NAMES = ["Theme", "Rainbow", "Sunset", "Ocean", "Neon", "Mono", "Nightclub", "Turbo", "Hyperdrive"]
+PALETTE_NAMES = ["Theme", "Rainbow", "Sunset", "Ocean", "Neon", "Mono", "Nightclub", "Turbo", "Hyperdrive", "Street Tuner"]
+TUNER = PALETTE_NAMES.index("Street Tuner")
 MODE_NAMES = ["3D Waterfall", "3D Bars", "3D Ring", "Neon Highway"]
 MODE_VIEWS = {0: (0.0, 0.5, 21.0), 1: (-0.35, 0.32, 13.0), 2: (-0.4, 0.45, 14.0), 3: (0.0, 0.10, 14.0)}
 
@@ -338,13 +354,17 @@ class Renderer:
     """Draws one frame into a framebuffer. Independent of the window system so it
     can also render offscreen (used for testing)."""
 
-    def __init__(self, ctx, width, height):
+    def __init__(self, ctx, width, height, quality=2):
         self.ctx = ctx
+        self.q = QUALITY[int(quality) % 4]
+        self.ultra = self.q["name"] == "Ultra"
+        self.rows = self.q["rows"]
+        self.max_sparks = self.q["sparks"]
         self.mode = 0
         self.palette_idx = 0
         self.levels = np.zeros(BANDS, "f4")
         self.peaks = np.zeros(BANDS, "f4")
-        self.hist = np.zeros((HIST, BANDS), "f4")
+        self.hist = np.zeros((self.rows, BANDS), "f4")
         self.scroll = 0.0
         self.beat = 0.0
         self._bass_avg = 0.0
@@ -357,6 +377,7 @@ class Renderer:
         self.t = 0.0
         self.dim = 1.0
         self.sparks = np.zeros((0, 8), "f4")  # pos3, vel3, life, band
+        self.cfg = dict(CUSTOM_DEFAULT)
         self._build(width, height)
 
     # -- GL resources -----------------------------------------------------
@@ -372,7 +393,7 @@ class Renderer:
         self.comp_prog = ctx.program(vertex_shader=QUAD_VS, fragment_shader=COMPOSITE_FS)
 
         self.box_vbo = ctx.buffer(box_mesh().tobytes())
-        self.inst_vbo = ctx.buffer(reserve=HIST * BANDS * 5 * 4 + 1024, dynamic=True)
+        self.inst_vbo = ctx.buffer(reserve=128 * BANDS * 5 * 4 + 1024, dynamic=True)
         self.bar_vao = ctx.vertex_array(self.bar_prog, [
             (self.box_vbo, "3f 3f", "in_pos", "in_norm"),
             (self.inst_vbo, "4f 1f/i", "in_inst", "in_age"),
@@ -382,7 +403,7 @@ class Renderer:
         self.floor_vao = ctx.vertex_array(self.floor_prog, [(quad, "2f", "in_pos")])
         self.quads = {p: ctx.vertex_array(p, [(quad, "2f", "in_pos")])
                       for p in (self.bg_prog, self.bright_prog, self.blur_prog, self.comp_prog)}
-        self.spark_vbo = ctx.buffer(reserve=4000 * 7 * 4, dynamic=True)
+        self.spark_vbo = ctx.buffer(reserve=8200 * 7 * 4, dynamic=True)
         self.spark_vao = ctx.vertex_array(self.spark_prog, [(self.spark_vbo, "3f 3f 1f", "in_pos", "in_col", "in_life")])
         self._targets(w, h)
 
@@ -393,7 +414,7 @@ class Renderer:
         self.scene_depth = ctx.depth_renderbuffer((self.w, self.h))
         self.scene_fbo = ctx.framebuffer([self.scene_tex], self.scene_depth)
         self.bloom = []
-        for div in (2, 4):
+        for div in (self.q["bloom"] or (8, 16)):
             size = (max(2, self.w // div), max(2, self.h // div))
             a = ctx.texture(size, 4, dtype="f2")
             b = ctx.texture(size, 4, dtype="f2")
@@ -422,7 +443,9 @@ class Renderer:
 
     # -- per-frame update ---------------------------------------------------
     def feed(self, bands, dt):
-        bands = np.clip(np.asarray(bands, "f4"), 0, 1)
+        c = self.cfg
+        # sensitivity as a dB shift of the 66 dB display range (x2 = +~10 dB)
+        bands = np.clip(np.asarray(bands, "f4") + np.log2(max(c["sens"], 0.05)) * 0.15, 0, 1)
         # fast attack, smooth fall (frame-rate independent)
         fall = math.exp(-dt * 7.5)
         self.levels = np.maximum(bands, self.levels * fall)
@@ -433,19 +456,21 @@ class Renderer:
         now = time.monotonic()
         if bass > self._bass_avg * 1.30 + 0.04 and bass > 0.25 and now - self._last_beat > 0.22:
             self._last_beat = now
-            self.beat = 1.0
-            self._spawn_sparks(28)
+            self.beat = min(2.0, c["beat"])
+            self._spawn_sparks(int(c["beat"] * 1.0 *28 * (1.7 if self.palette_idx == TUNER else 1.0) * self.max_sparks / 3500))
         self.beat *= math.exp(-dt * 5.0)
         if self.mode != self._mode_seen:
             self._mode_seen = self.mode
             self.reset_view()
         energy = float(self.levels.mean())
+        dens = self.rows / HIST * c["speed"]
+        tuner = self.palette_idx == TUNER
         if self.mode == 3:  # driving: speed follows the music
-            speed = 18.0 + 55.0 * energy + 25.0 * self.beat
-            self.road_off += dt * speed * 0.42
+            speed = (18.0 + 55.0 * energy + 25.0 * self.beat) * (1.35 if tuner else 1.0) * dens
+            self.road_off += dt * speed * 0.42 / dens
             self.scroll += dt * speed
         else:
-            self.scroll += dt * 26.0
+            self.scroll += dt * 26.0 * dens
         while self.scroll >= 1.0:
             self.scroll -= 1.0
             self.hist = np.roll(self.hist, 1, axis=0)
@@ -461,7 +486,7 @@ class Renderer:
         # camera: inertia + gentle auto-orbit when idle
         self.yaw_v *= math.exp(-dt * 3)
         self.yaw += self.yaw_v
-        if time.monotonic() - self.idle_since > 2.5:
+        if time.monotonic() - self.idle_since > 2.5 and c["spin"] > 0.5:
             if self.mode in (0, 3):
                 sway = 0.35 if self.mode == 0 else 0.12
                 self.yaw += (sway * math.sin(self.t * 0.15) - self.yaw) * min(1, dt * 0.5)  # slow sway
@@ -470,35 +495,46 @@ class Renderer:
         self.t += dt
 
     def _layout(self):
-        """Instance data (x, z, height, band, age) for the current mode."""
+        """Instance data (x, z, height, band, age) for the current mode, with the
+        user's height/width customisation applied."""
+        inst, bw, bd, ty = self._layout_raw()
+        inst = inst.copy()
+        inst[:, 2] *= self.cfg["height"]
+        return inst, bw * self.cfg["width"], bd * self.cfg["width"], ty
+
+    def _layout_raw(self):
         b = np.arange(BANDS, dtype="f4")
         band_t = b / (BANDS - 1)
         if self.mode == 0:  # waterfall
-            rows = np.arange(HIST, dtype="f4")
+            n = self.rows
+            spacing = 0.42 * HIST / n  # same depth, denser in Ultra
+            rows = np.arange(n, dtype="f4")
             xs = (b - (BANDS - 1) / 2) * 0.30
-            zs = (rows + self.scroll) * 0.42 - 2.0
+            zs = (rows + self.scroll) * spacing - 2.0
             X, Z = np.meshgrid(xs, zs)
             H = self.hist * 4.5
-            T = np.broadcast_to(band_t, (HIST, BANDS))
-            A = np.broadcast_to((rows / (HIST - 1))[:, None], (HIST, BANDS))
+            T = np.broadcast_to(band_t, (n, BANDS))
+            A = np.broadcast_to((rows / (n - 1))[:, None], (n, BANDS))
             inst = np.stack([X, -Z, H, T, A], axis=-1).reshape(-1, 5)
-            return inst, 0.22, 0.34, 13.0
+            return inst, 0.22, 0.34 * HIST / n, 13.0
         if self.mode == 1:  # bars with floating peak caps
             xs = (b - (BANDS - 1) / 2) * 0.30
             bars = np.stack([xs, np.zeros(BANDS), self.levels * 5.5, band_t, np.zeros(BANDS)], axis=1)
             return bars.astype("f4"), 0.22, 0.22, 11.0
         if self.mode == 3:  # neon highway: light walls both sides, rushing toward you
-            rows = np.arange(HIST, dtype="f4")
-            z = -HIST * 0.6 + (rows + self.scroll) * 0.6 + 6.0  # newest far ahead, rushing past
-            groups = self.hist.reshape(HIST, 8, 8).mean(axis=2)  # 8 bands per row
+            n = self.rows
+            sp = 0.6 * HIST / n
+            rows = np.arange(n, dtype="f4")
+            z = -n * sp + (rows + self.scroll) * sp + 6.0  # newest far ahead, rushing past
+            groups = self.hist.reshape(n, 8, 8).mean(axis=2)  # 8 bands per row
             inst = []
             for k in range(4):
                 left_h, right_h = groups[:, k] * 4.0, groups[:, 7 - k] * 4.0
                 xl, xr = -(3.7 + k * 0.75), 3.7 + k * 0.75
-                zeros = np.zeros(HIST, "f4")
-                inst.append(np.stack([np.full(HIST, xl), z, left_h, np.full(HIST, k / 7), zeros], 1))
-                inst.append(np.stack([np.full(HIST, xr), z, right_h, np.full(HIST, (7 - k) / 7), zeros], 1))
-            return np.concatenate(inst).astype("f4"), 0.45, 0.42, 0.0
+                zeros = np.zeros(n, "f4")
+                inst.append(np.stack([np.full(n, xl), z, left_h, np.full(n, k / 7), zeros], 1))
+                inst.append(np.stack([np.full(n, xr), z, right_h, np.full(n, (7 - k) / 7), zeros], 1))
+            return np.concatenate(inst).astype("f4"), 0.45, 0.42 * HIST / n, 0.0
         ang = b / BANDS * 2 * np.pi  # ring
         r = 5.0
         ring = np.stack([np.cos(ang) * r, np.sin(ang) * r, self.levels * 4.8, band_t, np.zeros(BANDS)], axis=1)
@@ -510,7 +546,7 @@ class Renderer:
             new = np.column_stack([x, np.random.uniform(0.2, 4.0, n), np.random.uniform(-40, -25, n),
                                    np.zeros(n), np.random.uniform(-1, 1, n), np.random.uniform(45, 70, n),
                                    np.random.uniform(0.7, 1.0, n), np.random.rand(n)]).astype("f4")
-            self.sparks = np.concatenate([self.sparks, new])[-3500:]
+            self.sparks = np.concatenate([self.sparks, new])[-self.max_sparks:]
             return
         inst, *_ = self._layout()
         if self.mode == 0:
@@ -520,7 +556,7 @@ class Renderer:
         vel = np.random.randn(n, 3).astype("f4") * [1.2, 0.8, 1.2] + [0, 5.0, 0]
         new = np.column_stack([pick[:, 0], pick[:, 2] + 0.1, pick[:, 1], vel,
                                np.random.uniform(0.6, 1.0, n), pick[:, 3]]).astype("f4")
-        self.sparks = np.concatenate([self.sparks, new])[-3500:]
+        self.sparks = np.concatenate([self.sparks, new])[-self.max_sparks:]
 
     # -- draw ------------------------------------------------------------------
     def render(self, fbo):
@@ -548,7 +584,7 @@ class Renderer:
         for p, names in ((self.bar_prog, ("beat", "dim", "fog_far")), (self.floor_prog, ("beat", "dim", "fog_far")),
                          (self.bg_prog, ("beat", "dim"))):
             for nm in names:
-                p[nm].value = {"beat": self.beat, "dim": self.dim, "fog_far": fog_far}[nm]
+                p[nm].value = {"beat": self.beat * min(1.5, self.cfg["glow"]), "dim": self.dim, "fog_far": fog_far}[nm]
 
         # 1) scene into HDR buffer
         self.scene_fbo.use()
@@ -565,8 +601,9 @@ class Renderer:
         n_inst = len(inst)
         # reflections first (below floor), then the floor, then real bars
         ctx.front_face = "cw"
-        bp["mirror"].value = -1.0
-        self.bar_vao.render(instances=n_inst)
+        if self.cfg["reflect"] > 0.5:
+            bp["mirror"].value = -1.0
+            self.bar_vao.render(instances=n_inst)
         ctx.front_face = "ccw"
         ctx.enable(ctx.BLEND)
         ctx.blend_func = ctx.SRC_ALPHA, ctx.ONE_MINUS_SRC_ALPHA
@@ -605,7 +642,7 @@ class Renderer:
 
         # 2) bloom: bright pass -> blur at 1/2 and 1/4 res
         src = self.scene_tex
-        for size, a, b, fa, fb in self.bloom:
+        for size, a, b, fa, fb in (self.bloom if self.q["bloom"] else []):
             fa.use()
             ctx.viewport = (0, 0, *size)
             src.use(0)
@@ -631,7 +668,7 @@ class Renderer:
         self.bloom[1][1].use(2)
         cp = self.comp_prog
         cp["scene"].value, cp["bloom1"].value, cp["bloom2"].value = 0, 1, 2
-        cp["bloom_amt"].value = 0.55 + self.beat * 0.7
+        cp["bloom_amt"].value = ((0.55 + self.beat * 0.7) * self.cfg["glow"]) if self.q["bloom"] else 0.0
         self.quads[self.comp_prog].render(ctx.TRIANGLE_STRIP)
 
 
@@ -661,8 +698,23 @@ def run_window(shm_name):
         pass
     data = np.ndarray((SHM_FLOATS,), dtype="f4", buffer=shm.buf)
 
-    cfg = pyglet.gl.Config(major_version=3, minor_version=3, forward_compatible=True,
-                           double_buffer=True, depth_size=24, sample_buffers=1, samples=4)
+    import sys
+
+    if sys.platform == "win32":  # audio always wins: the visualizer never outranks it
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+        except Exception:
+            pass
+    level = int(data[6]) % 4
+    q = QUALITY[level]
+    if q["samples"]:
+        cfg = pyglet.gl.Config(major_version=3, minor_version=3, forward_compatible=True,
+                               double_buffer=True, depth_size=24, sample_buffers=1, samples=q["samples"])
+    else:
+        cfg = pyglet.gl.Config(major_version=3, minor_version=3, forward_compatible=True,
+                               double_buffer=True, depth_size=24)
     try:
         win = pyglet.window.Window(1280, 720, "HomePod Link · 3D Visualizer", resizable=True, config=cfg, vsync=True)
     except Exception:
@@ -670,7 +722,7 @@ def run_window(shm_name):
                                double_buffer=True, depth_size=24)
         win = pyglet.window.Window(1280, 720, "HomePod Link · 3D Visualizer", resizable=True, config=cfg, vsync=True)
     ctx = moderngl.create_context(require=330)
-    r = Renderer(ctx, *win.get_framebuffer_size())
+    r = Renderer(ctx, *win.get_framebuffer_size(), quality=level)
     state = {"last": time.monotonic(), "title_t": 0.0, "hidden": False, "help_until": time.monotonic() + 6}
 
     def set_title(extra=""):
@@ -741,11 +793,14 @@ def run_window(shm_name):
             return
         paused = data[3] > 0.5 or state["hidden"]
         r.palette_idx = int(data[2])
+        for i, k in enumerate(CUSTOM_KEYS):
+            v = float(data[8 + i])
+            r.cfg[k] = v if v > 0 or k in ("spin", "reflect") else CUSTOM_DEFAULT[k]
         r.mode = int(data[4]) % 4
         target_dim = 0.25 if paused else 1.0
         r.dim += (target_dim - r.dim) * min(1, dt * 4)
         if not paused:
-            r.feed(data[8:8 + BANDS].copy(), dt)
+            r.feed(data[HDR:HDR + BANDS].copy(), dt)
         state["title_t"] += dt
         if state["title_t"] > 1:
             state["title_t"] = 0
@@ -753,7 +808,8 @@ def run_window(shm_name):
 
     set_title()
     pyglet.clock.schedule_interval(tick, 1 / 120)
-    pyglet.app.run(interval=1 / 240)  # redraw continuously; vsync caps it at the monitor refresh rate
+    # redraw continuously; vsync caps at the monitor refresh, Low/Medium cap lower
+    pyglet.app.run(interval=1 / q["fps"] if q["fps"] else 1 / 240)
     shm.close()
 
 
@@ -813,6 +869,7 @@ class VizBridge:
         self.shm = shared_memory.SharedMemory(create=True, size=SHM_FLOATS * 4)
         self.data = np.ndarray((SHM_FLOATS,), dtype="f4", buffer=self.shm.buf)
         self.data[:] = 0
+        self.set_custom(CUSTOM_DEFAULT)
         self.proc = None
         self.alive = True
         self.analyzer = Analyzer(sample_rate)
@@ -820,11 +877,11 @@ class VizBridge:
 
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def open(self, palette_idx=0, mode=0):
+    def open(self, palette_idx=0, mode=0, quality=2):
         import subprocess
         import sys
 
-        self.data[2], self.data[4], self.data[5] = palette_idx, mode, 0
+        self.data[2], self.data[4], self.data[5], self.data[6] = palette_idx, mode, 0, quality
         if self.proc and self.proc.poll() is None:
             return
         if getattr(sys, "frozen", False):
@@ -838,6 +895,10 @@ class VizBridge:
 
     def is_open(self):
         return self.proc is not None and self.proc.poll() is None
+
+    def set_custom(self, cfg):
+        for i, k in enumerate(CUSTOM_KEYS):
+            self.data[8 + i] = float(cfg.get(k, CUSTOM_DEFAULT[k]))
 
     def set(self, palette_idx=None, mode=None, paused=None):
         if palette_idx is not None:
@@ -866,7 +927,7 @@ class VizBridge:
                 end = min(end, wp)
                 a = (end - n) % tl.size
                 x = np.take(tl.ring[:, 0] + tl.ring[:, 1], range(a, a + n), mode="wrap") * 0.5
-            self.data[8:8 + BANDS] = self.analyzer.measure(x.astype("f8"))
+            self.data[HDR:HDR + BANDS] = self.analyzer.measure(x.astype("f8"))
             self.data[0] += 1
 
     def close(self):

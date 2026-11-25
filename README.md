@@ -39,6 +39,10 @@ GPU-rendered (OpenGL 3.3) in its own window, as a separate process, so it can ne
 - **Colors:** adds Nightclub, Turbo and Hyperdrive.
 - **Accurate, not decorative:** a calibrated multi-resolution analyzer (16k/8k/4k/1k FFT, Hann, ENBW-corrected, full-scale sine = 0 dBFS, 64 log bands). It's delayed by the stream latency, so the picture matches what the HomePods are playing.
 - **Pauses itself while a racing sim runs** (switchable), so it never costs frames on track.
+- **Quality levels:** Low (30 fps, no glow), Medium, High and Ultra (128-row waterfall, 8x MSAA, full-res bloom, 8,000 sparks). The window always runs at below-normal priority, so audio wins.
+- **Customize (per mode):** sensitivity, bar height and width, speed, glow, beat punch, auto-rotate and reflections.
+- **Colors:** adds Street Tuner (neon green and blue, with a faster, more aggressive Neon Highway).
+- **What's new:** a popup shows once after each update.
 
 ## Audio engine
 
